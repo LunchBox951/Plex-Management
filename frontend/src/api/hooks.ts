@@ -25,6 +25,8 @@ import type {
   LogsResponse,
   LogsTailResponse,
   MediaType,
+  NotificationListResponse,
+  NotifyAdminResponse,
   PlexLibraryOption,
   PlexServersResponse,
   PlexSignInRequest,
@@ -41,6 +43,8 @@ import type {
   SetupCompleteRequest,
   SetupStatusResponse,
   TileKey,
+  TvSeasonEpisodesResponse,
+  TvShowSeasonsResponse,
   UpdateStatusResponse,
   WithdrawSubscriptionResponse,
 } from './types'
@@ -1195,5 +1199,98 @@ export function useExportLogs() {
           parseAs: 'text',
         }),
       ),
+  })
+}
+
+/* ------------------------------------------------------- UI overhaul -- */
+
+/** A show's regular seasons for the TV request sheet's season tabs. */
+export function useTvSeasons(tmdbId: number, enabled = true) {
+  return useQuery({
+    queryKey: ['tv-seasons', tmdbId],
+    enabled,
+    staleTime: 10 * 60_000,
+    queryFn: async (): Promise<TvShowSeasonsResponse> =>
+      unwrap(
+        await client.GET('/api/v1/discover/tv/{tmdb_id}/seasons', {
+          params: { path: { tmdb_id: tmdbId } },
+        }),
+      ),
+  })
+}
+
+/** One season's episodes (ascending) for the TV request sheet. */
+export function useTvSeasonEpisodes(tmdbId: number, seasonNumber: number | null) {
+  return useQuery({
+    queryKey: ['tv-season-episodes', tmdbId, seasonNumber],
+    enabled: seasonNumber != null,
+    staleTime: 10 * 60_000,
+    queryFn: async (): Promise<TvSeasonEpisodesResponse> =>
+      unwrap(
+        await client.GET('/api/v1/discover/tv/{tmdb_id}/seasons/{season_number}', {
+          params: { path: { tmdb_id: tmdbId, season_number: seasonNumber ?? 0 } },
+        }),
+      ),
+  })
+}
+
+/**
+ * The current user's notifications. The backend answers 501 `not_implemented`
+ * until notifications land; callers check `isNotImplemented(error)` and show the
+ * honest "not available yet" state. No retry: a 501 won't change on retry.
+ */
+export function useNotifications(options?: { enabled?: boolean }) {
+  return useQuery({
+    queryKey: queryKeys.notifications,
+    enabled: options?.enabled ?? true,
+    retry: false,
+    queryFn: async (): Promise<NotificationListResponse> =>
+      unwrap(await client.GET('/api/v1/notifications')),
+  })
+}
+
+/** Mark the given notifications (or all, when `ids` is omitted) as read. */
+export function useMarkNotificationsRead() {
+  const qc = useQueryClient()
+  return useMutation({
+    mutationFn: async (ids?: number[]): Promise<NotificationListResponse> =>
+      unwrap(await client.POST('/api/v1/notifications/read', { body: { ids: ids ?? null } })),
+    onSuccess: (data) => {
+      qc.setQueryData(queryKeys.notifications, data)
+    },
+  })
+}
+
+/** "Let the admin know": the requester asks the admins for help with a request. */
+export function useNotifyAdmin() {
+  const qc = useQueryClient()
+  return useMutation({
+    mutationFn: async (args: { requestId: number; note?: string }): Promise<NotifyAdminResponse> =>
+      unwrap(
+        await client.POST('/api/v1/requests/{request_id}/notify-admin', {
+          params: { path: { request_id: args.requestId } },
+          body: { note: args.note ?? null },
+        }),
+      ),
+    onSuccess: () => {
+      void qc.invalidateQueries({ queryKey: queryKeys.notifications })
+    },
+  })
+}
+
+/** Admin "Import anyway": import a blocked download despite its mismatch. */
+export function useForceImport() {
+  const qc = useQueryClient()
+  return useMutation({
+    mutationFn: async (downloadId: number): Promise<QueueItem> =>
+      unwrap(
+        await client.POST('/api/v1/queue/{download_id}/force-import', {
+          params: { path: { download_id: downloadId } },
+        }),
+      ),
+    onSuccess: () => {
+      void qc.invalidateQueries({ queryKey: queryKeys.queue })
+      void qc.invalidateQueries({ queryKey: queryKeys.requests })
+    },
   })
 }

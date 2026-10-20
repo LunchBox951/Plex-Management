@@ -125,3 +125,12 @@ export function libraryOptionNote(lib: PlexLibraryOption): string {
   }
   return ''
 }
+
+// UI overhaul: TV request sheet lookups, notifications, "Let the admin know".
+export type TvShowSeasonsResponse = Schemas['TvShowSeasonsResponse']
+export type TvSeasonEpisodesResponse = Schemas['TvSeasonEpisodesResponse']
+export type TvEpisodeItem = Schemas['TvEpisodeItem']
+export type TvRequestMode = NonNullable<CreateRequestBody['tv_mode']>
+export type NotificationItem = Schemas['NotificationItem']
+export type NotificationListResponse = Schemas['NotificationListResponse']
+export type NotifyAdminResponse = Schemas['NotifyAdminResponse']

@@ -192,3 +192,12 @@ export function isApiError(value: unknown): value is ApiError {
     typeof (value as ApiError).status === 'number'
   )
 }
+
+/**
+ * True when the backend answered 501 `not_implemented`: a planned feature whose
+ * endpoint hasn't landed yet. Screens show an honest "not available yet" state
+ * for it instead of a generic failure.
+ */
+export function isNotImplemented(error: unknown): boolean {
+  return isApiError(error) && (error.code === 'not_implemented' || error.status === 501)
+}

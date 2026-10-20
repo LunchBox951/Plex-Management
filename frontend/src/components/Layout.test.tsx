@@ -13,12 +13,14 @@ const h = vi.hoisted(
     logout: ReturnType<typeof vi.fn>
     auth: MockAuth
     requests: MockRequests
+    unread: number
   } => ({
     logout: vi.fn(),
     auth: {
       data: { authenticated: true, auth_method: 'plex_session', is_admin: true, user: null },
     },
     requests: { data: { requests: [] } },
+    unread: 0,
   }),
 )
 
@@ -32,14 +34,23 @@ vi.mock('./HealthDot', () => ({
   HealthDot: () => <div>Health</div>,
 }))
 
-// SearchOverlay owns its detailed Radix/keyboard/query behavior in its focused
-// suite; shell tests keep only the authenticated-header integration seam.
+// SearchOverlay owns its detailed Radix/query behavior in its focused suite;
+// shell tests keep only the integration seam: who opens it, and when.
 vi.mock('./SearchOverlay', () => ({
-  SearchOverlay: () => (
-    <button type="button" aria-label="Search TMDB to request">
-      Search
+  SearchOverlay: ({ open }: { open?: boolean }) =>
+    open ? <div role="dialog" aria-label="Search dialog" /> : null,
+}))
+
+vi.mock('./notifications/NotificationBell', () => ({
+  NotificationBell: () => (
+    <button type="button" aria-label="Notifications">
+      Bell
     </button>
   ),
+}))
+
+vi.mock('./notifications/useUnreadNotificationCount', () => ({
+  useUnreadNotificationCount: () => h.unread,
 }))
 
 function requestRow(id: number, status: RequestResponse['status']): RequestResponse {
@@ -52,7 +63,7 @@ function requestRow(id: number, status: RequestResponse['status']): RequestRespo
     is_anime: false,
     keep_forever: false,
     can_mutate: false,
-    is_owner: false,
+    is_owner: true,
     can_withdraw: false,
     has_other_participants: false,
   }
@@ -80,40 +91,12 @@ describe('Layout', () => {
       data: { authenticated: true, auth_method: 'plex_session', is_admin: true, user: null },
     }
     vi.mocked(useAuthMe).mockReturnValue(h.auth as never)
+    h.unread = 0
     setRequests({ requests: [] })
     vi.mocked(useRequests).mockClear()
   })
 
-  it('renders labelled user and administration navigation zones for admins', () => {
-    renderAt()
-
-    const userNav = screen.getByRole('navigation', { name: 'User' })
-    expect(within(userNav).getByRole('link', { name: 'Discover' })).toBeInTheDocument()
-    expect(within(userNav).getByRole('link', { name: 'Requests' })).toBeInTheDocument()
-
-    const adminNav = screen.getByRole('navigation', { name: 'Administration' })
-    for (const label of ['Queue', 'Status', 'Logs', 'Settings', 'Blocklist']) {
-      expect(within(adminNav).getByRole('link', { name: label })).toBeInTheDocument()
-    }
-    expect(screen.getAllByRole('separator')).toHaveLength(1)
-  })
-
-  it('uses separate active treatments for user and administration links', () => {
-    const view = renderAt('/requests')
-
-    const requestsLink = screen.getByRole('link', { name: 'Requests' })
-    expect(requestsLink).toHaveClass('bg-white/8', 'text-ink')
-    expect(requestsLink).toHaveAttribute('aria-current', 'page')
-
-    view.unmount()
-    renderAt('/status')
-
-    const statusLink = screen.getByRole('link', { name: 'Status' })
-    expect(statusLink).toHaveClass('bg-gold/12', 'text-gold')
-    expect(statusLink).toHaveAttribute('aria-current', 'page')
-  })
-
-  it('shows only the user zone and a non-interactive health indicator to shared Plex users', () => {
+  function setSharedUser() {
     h.auth = {
       data: {
         authenticated: true,
@@ -123,19 +106,45 @@ describe('Layout', () => {
       },
     }
     vi.mocked(useAuthMe).mockReturnValue(h.auth as never)
+  }
 
+  it('renders the watching nav and the Manage button for admins', () => {
     renderAt()
 
-    const userNav = screen.getByRole('navigation', { name: 'User' })
-    expect(within(userNav).getByRole('link', { name: 'Discover' })).toBeInTheDocument()
-    expect(within(userNav).getByRole('link', { name: 'Requests' })).toBeInTheDocument()
-    expect(screen.queryByRole('navigation', { name: 'Administration' })).not.toBeInTheDocument()
-    expect(screen.queryByRole('separator')).not.toBeInTheDocument()
-    for (const label of ['Queue', 'Status', 'Logs', 'Settings', 'Blocklist']) {
-      expect(screen.queryByRole('link', { name: label })).not.toBeInTheDocument()
+    const main = screen.getByRole('navigation', { name: 'Main' })
+    for (const label of ['Home', 'Movies', 'TV', 'My requests']) {
+      expect(within(main).getByRole('link', { name: label })).toBeInTheDocument()
     }
-    expect(screen.getByText('Health').closest('a')).toBeNull()
-    expect(screen.getByRole('button', { name: 'Search TMDB to request' })).toBeInTheDocument()
+    expect(screen.getAllByRole('link', { name: /^Manage/ })[0]).toHaveAttribute('href', '/manage')
+    // Manage's own tabs only appear in Manage mode.
+    expect(screen.queryByRole('navigation', { name: 'Manage' })).not.toBeInTheDocument()
+  })
+
+  it('shows Manage mode tabs and System health on /manage paths', () => {
+    renderAt('/manage/requests')
+
+    const manage = screen.getByRole('navigation', { name: 'Manage' })
+    for (const label of ['Needs attention', 'Requests', 'Downloads', 'Blocklist', 'Settings']) {
+      expect(within(manage).getByRole('link', { name: label })).toBeInTheDocument()
+    }
+    expect(within(manage).getByRole('link', { name: 'Requests' })).toHaveAttribute('aria-current', 'page')
+    expect(within(manage).getByRole('link', { name: /System health/ })).toHaveAttribute(
+      'href',
+      '/manage/health',
+    )
+    // The watching nav reads inactive while in Manage mode.
+    expect(
+      within(screen.getByRole('navigation', { name: 'Main' })).getByRole('link', { name: 'Home' }),
+    ).not.toHaveClass('bg-white/8')
+  })
+
+  it('never shows Manage to shared Plex users', () => {
+    setSharedUser()
+    renderAt()
+
+    expect(screen.queryByRole('link', { name: /^Manage/ })).not.toBeInTheDocument()
+    expect(screen.queryByRole('navigation', { name: 'Manage' })).not.toBeInTheDocument()
+    expect(screen.getByRole('navigation', { name: 'Tabs' })).toBeInTheDocument()
   })
 
   it('counts only in-flight request statuses and keeps stale data visible on error', () => {
@@ -167,14 +176,27 @@ describe('Layout', () => {
 
     renderAt('/requests')
 
-    const requestsLink = screen.getByRole('link', {
-      name: 'Requests, 5 active requests',
-    })
-    expect(within(requestsLink).getByText('5').parentElement).toHaveClass(
-      'bg-gold',
-      'text-gold-ink',
-    )
+    const main = screen.getByRole('navigation', { name: 'Main' })
+    const requestsLink = within(main).getByRole('link', { name: 'My requests, 5 active requests' })
+    expect(within(requestsLink).getByText('5').parentElement).toHaveClass('bg-gold', 'text-gold-ink')
     expect(useRequests).toHaveBeenCalledWith({ poll: true })
+  })
+
+  it('counts requests that need attention on the Manage button (admins only)', () => {
+    setRequests({
+      requests: [
+        requestRow(1, 'import_blocked'),
+        requestRow(2, 'no_acceptable_release'),
+        requestRow(3, 'failed'),
+        requestRow(4, 'downloading'),
+      ],
+    })
+    renderAt()
+
+    const manage = screen.getAllByRole('link', { name: /^Manage/ })[0]!
+    expect(manage).toHaveAccessibleName('Manage, 2 need attention')
+    // A round badge, never a key-cap shape.
+    expect(within(manage).getByText('2').parentElement).toHaveClass('rounded-full', 'bg-error')
   })
 
   it('hides the request badge while unresolved and when the resolved count is zero', () => {
@@ -188,22 +210,34 @@ describe('Layout', () => {
     renderAt('/requests')
 
     expect(screen.queryByText(/active requests?/)).not.toBeInTheDocument()
-    expect(screen.getByRole('link', { name: 'Requests' })).toBeInTheDocument()
   })
 
-  it('links the health indicator to Status for admins', () => {
+  it('opens search from the phone Search tab', () => {
     renderAt()
 
-    const healthLink = screen.getByRole('link', { name: 'Open system status: Health' })
-    expect(healthLink).toHaveAttribute('href', '/status')
-    expect(healthLink).toHaveAttribute('title', 'Open system status')
-    expect(healthLink).toHaveClass('min-h-6', 'focus-visible:ring-2')
+    expect(screen.queryByRole('dialog', { name: 'Search dialog' })).not.toBeInTheDocument()
+    fireEvent.click(
+      within(screen.getByRole('navigation', { name: 'Tabs' })).getByRole('button', { name: 'Search' }),
+    )
+    expect(screen.getByRole('dialog', { name: 'Search dialog' })).toBeInTheDocument()
   })
 
-  it('revokes the current session from the header', () => {
+  it('shows the unread notification count on the phone Notifications tab', () => {
+    h.unread = 3
     renderAt()
 
-    fireEvent.click(screen.getByRole('button', { name: /sign out/i }))
+    const tabs = screen.getByRole('navigation', { name: 'Tabs' })
+    expect(within(tabs).getByRole('link', { name: /Notifications/ })).toHaveAccessibleName(
+      /3 unread notifications/,
+    )
+  })
+
+  it('signs out from the profile menu', async () => {
+    renderAt()
+
+    const profile = screen.getByRole('button', { name: 'Profile' })
+    fireEvent.pointerDown(profile, { button: 0, ctrlKey: false, pointerType: 'mouse' })
+    fireEvent.click(await screen.findByRole('menuitem', { name: /sign out/i }))
 
     expect(h.logout).toHaveBeenCalledTimes(1)
   })

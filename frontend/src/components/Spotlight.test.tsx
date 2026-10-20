@@ -8,6 +8,11 @@ import { useToast } from './ui/toast'
 
 vi.mock('../api/hooks', () => ({ useCreateRequest: vi.fn() }))
 vi.mock('./ui/toast', () => ({ useToast: vi.fn() }))
+// The TV request sheet has its own suite; here it only has to prove it opened.
+vi.mock('./TvRequestPicker', () => ({
+  TvRequestPicker: ({ open, title }: { open: boolean; title: string }) =>
+    open ? <div role="dialog" aria-label={`Request ${title}`} /> : null,
+}))
 
 const MOVIE: DiscoverResult = {
   tmdb_id: 1,
@@ -462,5 +467,17 @@ describe('Spotlight — banner size and fade (#275, #276)', () => {
     expect(sideFade.className).toMatch(/\bspotlight-side-fade\b/)
     expect(sideFade.className).toMatch(/\babsolute\b/)
     expect(sideFade.className).toMatch(/\binset-0\b/)
+  })
+})
+
+describe('Spotlight — TV requests open the request sheet (UI overhaul)', () => {
+  it('opens the TV request sheet instead of requesting the whole series', () => {
+    const mutation = setupMutation()
+    renderSpotlight({ items: [SHOW] })
+
+    fireEvent.click(screen.getByRole('button', { name: '+ Request' }))
+
+    expect(screen.getByRole('dialog', { name: `Request ${SHOW.title}` })).toBeInTheDocument()
+    expect(mutation.mutateAsync).not.toHaveBeenCalled()
   })
 })

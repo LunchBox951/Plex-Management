@@ -850,7 +850,7 @@ function DiskRootCard({
         <div className="mt-3 flex flex-col items-start gap-2">
           <p className="text-xs text-error">This library folder isn't visible to Plex Manager.</p>
           <p className="font-mono text-[11px] break-all text-faint">{root.error}</p>
-          <LinkButton variant="secondary" size="sm" to="/settings">
+          <LinkButton variant="secondary" size="sm" to="/manage/settings">
             Fix in Settings
           </LinkButton>
         </div>

@@ -23,6 +23,7 @@ from plex_manager.repositories.downloads import SqlDownloadRepository
 from plex_manager.repositories.season_requests import SqlSeasonRequestRepository
 from plex_manager.services import (
     correction_service,
+    forced_import_service,
     grab_service,
     import_service,
     queue_service,
@@ -61,6 +62,7 @@ from plex_manager.web.events import publish_realtime
 from plex_manager.web.routers.search_preview import run_preview, stored_episodes_for_request
 from plex_manager.web.schemas import (
     ErrorDetail,
+    ErrorEnvelope,
     GrabRequest,
     QueueItem,
     QueueResponse,
@@ -538,6 +540,24 @@ async def mark_failed_endpoint(
         reason="mark_failed",
     )
     return item
+
+
+@router.post(
+    "/{download_id}/force-import",
+    responses={501: {"model": ErrorEnvelope, "description": "Not available yet"}},
+)
+async def force_import_endpoint(
+    download_id: int,
+    session: Annotated[AsyncSession, Depends(get_session)],
+) -> QueueItem:
+    """Admin "Import anyway": import a blocked download despite its mismatch.
+
+    Not implemented yet -- answers 501 ``not_implemented`` (see
+    ``services.forced_import_service``). The UI confirms first and lists the side
+    effects (wrong files may land under the requested season; the request is
+    marked done and not searched again; undo via Report a problem).
+    """
+    await forced_import_service.force_import(session, download_id=download_id)
 
 
 @router.post("/{download_id}/relocate", responses=_QUEUE_ERROR_RESPONSES)

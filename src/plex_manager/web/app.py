@@ -128,6 +128,7 @@ from plex_manager.web.routers import auth as auth_router
 from plex_manager.web.routers import blocklist as blocklist_router
 from plex_manager.web.routers import discovery as discovery_router
 from plex_manager.web.routers import events as events_router
+from plex_manager.web.routers import notifications as notifications_router
 from plex_manager.web.routers import ops as ops_router
 from plex_manager.web.routers import quality_profile as quality_profile_router
 from plex_manager.web.routers import queue as queue_router
@@ -2301,6 +2302,7 @@ def create_app() -> FastAPI:
     app.include_router(artwork_router.router)
     app.include_router(events_router.router)
     app.include_router(requests_router.router)
+    app.include_router(notifications_router.router)
     app.include_router(search_preview_router.router)
     app.include_router(queue_router.router)
     app.include_router(blocklist_router.router)

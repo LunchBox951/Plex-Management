@@ -42,6 +42,12 @@ vi.mock('../api/hooks', () => {
     useReportIssue: vi.fn(() => ({ mutateAsync: vi.fn(), isPending: false })),
     useCancelRequest: vi.fn(() => ({ mutateAsync: vi.fn(), isPending: false })),
     useWithdrawSubscription: vi.fn(() => ({ mutateAsync: vi.fn(), isPending: false })),
+    useNotifyAdmin: vi.fn(() => ({
+      mutate: vi.fn(),
+      isPending: false,
+      isSuccess: false,
+      isError: false,
+    })),
   }
 })
 
@@ -104,7 +110,8 @@ function movieRequest(overrides: Partial<RequestResponse> = {}): RequestResponse
     is_anime: false,
     keep_forever: false,
     can_mutate: false,
-    is_owner: false,
+    // My requests lists only the viewer's own (or joined) requests.
+    is_owner: true,
     can_withdraw: false,
     has_other_participants: false,
     ...overrides,
@@ -117,11 +124,12 @@ function tvRequest(overrides: Partial<RequestResponse> = {}): RequestResponse {
     tmdb_id: 100,
     media_type: 'tv',
     title: 'Test Show',
-    status: 'partially_available',
+    status: 'downloading',
     is_anime: false,
     keep_forever: false,
     can_mutate: false,
-    is_owner: false,
+    // My requests lists only the viewer's own (or joined) requests.
+    is_owner: true,
     can_withdraw: false,
     has_other_participants: false,
     seasons: [
@@ -140,8 +148,8 @@ describe('Requests — per-season status list', () => {
       isError: false,
     })
     render(<Requests />, { wrapper: MemoryRouter })
-    // The overall status renders...
-    expect(screen.getByText(/downloading/i)).toBeInTheDocument()
+    // The overall status renders (badge + plain-words line)...
+    expect(screen.getAllByText(/downloading/i).length).toBeGreaterThan(0)
     // ...but there is no per-season badge (movies carry no seasons at all).
     expect(screen.queryByText(/S1/)).not.toBeInTheDocument()
     expect(screen.queryByText(/S2/)).not.toBeInTheDocument()
@@ -149,11 +157,13 @@ describe('Requests — per-season status list', () => {
 
   it('lists every tracked season, each with its OWN status, for a tv row', () => {
     ;(useRequests as unknown as Mock).mockReturnValue({
-      data: { requests: [tvRequest()] },
+      data: { requests: [tvRequest({ status: 'partially_available' })] },
       isLoading: false,
       isError: false,
     })
     render(<Requests />, { wrapper: MemoryRouter })
+    // A partially available show has arrived: it lives under Done.
+    fireEvent.click(screen.getByRole('tab', { name: 'Done' }))
     // The show-level rollup...
     expect(screen.getByText(/partially available/i)).toBeInTheDocument()
     // ...alongside each season's own status.
@@ -338,90 +348,10 @@ describe('Requests — truthful inline download progress', () => {
   })
 })
 
-describe('Requests — admin no-release shortcut', () => {
-  it('opens the modal and runs its one shared preview path exactly once', async () => {
-    const previewMutation = vi.fn().mockResolvedValue(EMPTY_PREVIEW)
-    ;(useSearchPreview as unknown as Mock).mockReturnValue({
-      mutateAsync: previewMutation,
-      isPending: false,
-    })
-    ;(useRequests as unknown as Mock).mockReturnValue({
-      data: {
-        requests: [movieRequest({ id: 17, status: 'no_acceptable_release' })],
-      },
-      isLoading: false,
-      isError: false,
-    })
-    const view = render(<Requests />, { wrapper: MemoryRouter })
-
-    const details = screen.getByRole('button', { name: 'Open details for Test Movie' })
-    const shortcut = screen.getByRole('button', { name: 'Re-search Test Movie' })
-    expect(details.contains(shortcut)).toBe(false)
-    expect(shortcut.contains(details)).toBe(false)
-
-    fireEvent.click(shortcut)
-    expect(screen.getByRole('heading', { name: 'Test Movie' })).toBeInTheDocument()
-    await waitFor(() => expect(previewMutation).toHaveBeenCalledWith({ request_id: 17 }))
-    expect(previewMutation).toHaveBeenCalledTimes(1)
-
-    // The same action token survives ordinary route/modal rerenders but is already
-    // consumed, so the effect cannot fire a second API request.
-    view.rerender(<Requests />)
-    await waitFor(() => expect(previewMutation).toHaveBeenCalledTimes(1))
-  })
-
-  it('targets the row-resolved no-release TV season for an inline re-search', async () => {
-    const previewMutation = vi.fn().mockResolvedValue(EMPTY_PREVIEW)
-    ;(useSearchPreview as unknown as Mock).mockReturnValue({
-      mutateAsync: previewMutation,
-      isPending: false,
-    })
-    ;(useRequests as unknown as Mock).mockReturnValue({
-      data: {
-        requests: [
-          tvRequest({
-            id: 23,
-            status: 'no_acceptable_release',
-            seasons: [
-              { season_number: 1, status: 'available' },
-              { season_number: 2, status: 'no_acceptable_release' },
-            ],
-          }),
-        ],
-      },
-      isLoading: false,
-      isError: false,
-    })
-    render(<Requests />, { wrapper: MemoryRouter })
-
-    fireEvent.click(screen.getByRole('button', { name: 'Re-search Test Show' }))
-    await waitFor(() =>
-      expect(previewMutation).toHaveBeenCalledWith({ request_id: 23, season: 2 }),
-    )
-    expect(previewMutation).toHaveBeenCalledTimes(1)
-  })
-
-  it('is hidden for shared/unknown users and for statuses other than no-release', () => {
-    ;(useAuthMe as unknown as Mock).mockReturnValue({ data: undefined, isLoading: true })
-    ;(useRequests as unknown as Mock).mockReturnValue({
-      data: {
-        requests: [
-          movieRequest({ id: 1, status: 'no_acceptable_release' }),
-          movieRequest({ id: 2, title: 'Searching Movie', status: 'searching' }),
-        ],
-      },
-      isLoading: false,
-      isError: false,
-    })
-    render(<Requests />, { wrapper: MemoryRouter })
-    expect(screen.queryByRole('button', { name: /re-search/i })).not.toBeInTheDocument()
-  })
-})
-
 describe('Requests — opening the shared TitleDetailModal from a row', () => {
   it('clicking a movie row opens the modal on that title', () => {
     ;(useRequests as unknown as Mock).mockReturnValue({
-      data: { requests: [movieRequest({ status: 'no_acceptable_release' })] },
+      data: { requests: [movieRequest({ status: 'searching' })] },
       isLoading: false,
       isError: false,
     })
@@ -464,5 +394,56 @@ describe('Requests — opening the shared TitleDetailModal from a row', () => {
     details.focus()
     await user.keyboard(' ')
     expect(screen.getByRole('heading', { name: 'Test Movie' })).toBeInTheDocument()
+  })
+})
+
+describe('My requests — grouping and the stuck-request card', () => {
+  it('lists only the viewer\'s own requests', () => {
+    ;(useRequests as unknown as Mock).mockReturnValue({
+      data: {
+        requests: [
+          movieRequest({ id: 1, title: 'Mine', status: 'searching' }),
+          movieRequest({ id: 2, title: 'Not mine', status: 'searching', is_owner: false }),
+        ],
+      },
+      isLoading: false,
+      isError: false,
+    })
+    render(<Requests />, { wrapper: MemoryRouter })
+    expect(screen.getByText('Mine')).toBeInTheDocument()
+    expect(screen.queryByText('Not mine')).not.toBeInTheDocument()
+  })
+
+  it('shows a stuck request as a problem card with Let the admin know', () => {
+    ;(useRequests as unknown as Mock).mockReturnValue({
+      data: { requests: [movieRequest({ status: 'import_blocked', can_mutate: true })] },
+      isLoading: false,
+      isError: false,
+    })
+    render(<Requests />, { wrapper: MemoryRouter })
+    expect(screen.getByText('Needs the admin')).toBeInTheDocument()
+    expect(screen.getByRole('heading', { name: 'Something went wrong with the download' })).toBeInTheDocument()
+    expect(screen.getByRole('button', { name: 'Let the admin know' })).toBeInTheDocument()
+    // Fixes are admin-only: never offered on the requester's card.
+    expect(screen.queryByRole('button', { name: /import anyway/i })).not.toBeInTheDocument()
+  })
+
+  it('splits active and done requests across the two tabs', () => {
+    ;(useRequests as unknown as Mock).mockReturnValue({
+      data: {
+        requests: [
+          movieRequest({ id: 1, title: 'Arriving', status: 'downloading' }),
+          movieRequest({ id: 2, title: 'Arrived', status: 'available' }),
+        ],
+      },
+      isLoading: false,
+      isError: false,
+    })
+    render(<Requests />, { wrapper: MemoryRouter })
+    expect(screen.getByText('Arriving')).toBeInTheDocument()
+    expect(screen.queryByText('Arrived')).not.toBeInTheDocument()
+    fireEvent.click(screen.getByRole('tab', { name: 'Done' }))
+    expect(screen.getByText('Arrived')).toBeInTheDocument()
+    expect(screen.queryByText('Arriving')).not.toBeInTheDocument()
   })
 })

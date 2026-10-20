@@ -191,16 +191,16 @@ function setLiveStates(
 
 function openOverlay(): { trigger: HTMLButtonElement; input: HTMLInputElement } {
   const trigger = screen.getByRole('button', {
-    name: 'Search TMDB to request',
+    name: 'Search movies and shows',
   }) as HTMLButtonElement
   trigger.focus()
   fireEvent.click(trigger)
-  const input = screen.getByRole('searchbox', { name: 'Search TMDB' }) as HTMLInputElement
+  const input = screen.getByRole('searchbox', { name: 'Search movies and shows' }) as HTMLInputElement
   return { trigger, input }
 }
 
 async function enterSearch(query: string): Promise<HTMLInputElement> {
-  const input = screen.getByRole('searchbox', { name: 'Search TMDB' }) as HTMLInputElement
+  const input = screen.getByRole('searchbox', { name: 'Search movies and shows' }) as HTMLInputElement
   fireEvent.change(input, { target: { value: query } })
   await waitFor(
     () => {
@@ -245,7 +245,7 @@ describe('SearchOverlay — trigger, keyboard, and focus', () => {
 
     fireEvent.click(screen.getByRole('button', { name: 'Close search' }))
     await waitFor(() => {
-      expect(screen.queryByRole('searchbox', { name: 'Search TMDB' })).not.toBeInTheDocument()
+      expect(screen.queryByRole('searchbox', { name: 'Search movies and shows' })).not.toBeInTheDocument()
       expect(first.trigger).toHaveFocus()
     })
 
@@ -253,58 +253,34 @@ describe('SearchOverlay — trigger, keyboard, and focus', () => {
     expect(second.input).toHaveValue('')
     fireEvent.keyDown(second.input, { key: 'Escape' })
     await waitFor(() => {
-      expect(screen.queryByRole('searchbox', { name: 'Search TMDB' })).not.toBeInTheDocument()
+      expect(screen.queryByRole('searchbox', { name: 'Search movies and shows' })).not.toBeInTheDocument()
       expect(second.trigger).toHaveFocus()
     })
   })
 
-  it('opens with / and prevents the shortcut keystroke default', () => {
+  it('has no keyboard shortcut: pressing / does nothing (Interactions: one click, no shortcuts)', () => {
     render(<SearchOverlay />)
     const slash = new KeyboardEvent('keydown', { key: '/', bubbles: true, cancelable: true })
 
     act(() => document.dispatchEvent(slash))
 
-    expect(slash.defaultPrevented).toBe(true)
-    expect(screen.getByRole('searchbox', { name: 'Search TMDB' })).toHaveFocus()
+    expect(slash.defaultPrevented).toBe(false)
+    expect(
+      screen.queryByRole('searchbox', { name: 'Search movies and shows' }),
+    ).not.toBeInTheDocument()
   })
 
-  it('does not hijack / from editable controls or another open dialog', () => {
-    const first = render(
-      <>
-        <input aria-label="Elsewhere" />
-        <SearchOverlay />
-      </>,
-    )
-    const elsewhere = screen.getByRole('textbox', { name: 'Elsewhere' })
-    elsewhere.focus()
-    const editableSlash = new KeyboardEvent('keydown', {
-      key: '/',
-      bubbles: true,
-      cancelable: true,
-    })
+  it('can be opened by the shell without its own trigger (phone Search tab)', () => {
+    const onOpenChange = vi.fn()
+    const view = render(<SearchOverlay open={false} onOpenChange={onOpenChange} trigger="none" />)
 
-    act(() => elsewhere.dispatchEvent(editableSlash))
+    expect(screen.queryByRole('button', { name: 'Search movies and shows' })).not.toBeInTheDocument()
 
-    expect(editableSlash.defaultPrevented).toBe(false)
-    expect(screen.queryByRole('searchbox', { name: 'Search TMDB' })).not.toBeInTheDocument()
+    view.rerender(<SearchOverlay open onOpenChange={onOpenChange} trigger="none" />)
 
-    first.unmount()
-    render(
-      <>
-        <div role="alertdialog" aria-label="Existing dialog" />
-        <SearchOverlay />
-      </>,
-    )
-    const dialogSlash = new KeyboardEvent('keydown', {
-      key: '/',
-      bubbles: true,
-      cancelable: true,
-    })
-
-    act(() => document.dispatchEvent(dialogSlash))
-
-    expect(dialogSlash.defaultPrevented).toBe(false)
-    expect(screen.queryByRole('searchbox', { name: 'Search TMDB' })).not.toBeInTheDocument()
+    expect(screen.getByRole('searchbox', { name: 'Search movies and shows' })).toBeInTheDocument()
+    fireEvent.click(screen.getByRole('button', { name: 'Close search' }))
+    expect(onOpenChange).toHaveBeenLastCalledWith(false)
   })
 })
 

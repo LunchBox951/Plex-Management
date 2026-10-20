@@ -36,6 +36,8 @@ vi.mock('../api/hooks', () => ({
   // The modal's title-scoped read (issue #370 phase 2) — this suite never opens
   // it with pre-existing request state, so an idle empty read is enough.
   useTitleRequests: vi.fn(() => ({ data: { requests: [] }, authoritative: true })),
+  // Home's personal sections (UI overhaul) read the viewer's request list.
+  useRequests: vi.fn(() => ({ data: { requests: [] } })),
 }))
 
 vi.mock('../components/ui/toast', () => ({ useToast: () => ({ toast: vi.fn() }) }))
@@ -360,5 +362,63 @@ describe('Discover — tv quick-request is first-time only (Codex P2)', () => {
     mockLiveStates({ 'movie:1': liveState({ status: 'cancelled', has_history: true }) })
     render(<Discover />)
     expect(screen.getByRole('button', { name: REQUEST_MOVIE })).toBeInTheDocument()
+  })
+})
+
+describe('Discover — Movies / TV pages and Home activity (UI overhaul)', () => {
+  it('keeps only movie items and drops rows left empty on the Movies page', () => {
+    ;(useDiscoverHome as unknown as Mock).mockReturnValue({
+      data: {
+        spotlights: [HERO],
+        rows: [
+          { row_type: 'trending', title: 'Trending', items: [MOVIE, SHOW] },
+          { row_type: 'popular_tv', title: 'Popular TV', items: [SHOW] },
+        ],
+      },
+      isLoading: false,
+      isError: false,
+      dataUpdatedAt: Date.now(),
+    })
+    render(<Discover mediaType="movie" />, { wrapper: MemoryRouter })
+
+    expect(screen.getAllByText(MOVIE.title).length).toBeGreaterThan(0)
+    expect(screen.queryByText(SHOW.title)).not.toBeInTheDocument()
+    expect(screen.queryByRole('heading', { name: 'Popular TV' })).not.toBeInTheDocument()
+  })
+
+  it('shows Ready to watch and On the way on Home from the viewer\'s own requests', async () => {
+    const { useRequests } = await import('../api/hooks')
+    const base = {
+      is_anime: false,
+      keep_forever: false,
+      can_mutate: true,
+      is_owner: true,
+      can_withdraw: false,
+      has_other_participants: false,
+    }
+    ;(useRequests as unknown as Mock).mockReturnValue({
+      data: {
+        requests: [
+          { ...base, id: 1, tmdb_id: 10, media_type: 'movie', title: 'Arrived', status: 'available' },
+          { ...base, id: 2, tmdb_id: 11, media_type: 'movie', title: 'Coming', status: 'searching' },
+          {
+            ...base,
+            id: 3,
+            tmdb_id: 12,
+            media_type: 'movie',
+            title: 'Someone elses',
+            status: 'searching',
+            is_owner: false,
+          },
+        ],
+      },
+    })
+    render(<Discover showActivity />, { wrapper: MemoryRouter })
+
+    expect(screen.getByRole('heading', { name: 'Ready to watch' })).toBeInTheDocument()
+    expect(screen.getByRole('button', { name: /Arrived/ })).toBeInTheDocument()
+    expect(screen.getByRole('heading', { name: 'On the way' })).toBeInTheDocument()
+    expect(screen.getByText('Looking for a good copy')).toBeInTheDocument()
+    expect(screen.queryByText('Someone elses')).not.toBeInTheDocument()
   })
 })

@@ -2,6 +2,7 @@ import { useMemo, useState } from 'react'
 import { useOutletContext } from 'react-router'
 import { useDiscoverHome } from '../api/hooks'
 import type { DiscoverResult } from '../api/types'
+import { ActivitySections } from '../components/home/ActivitySections'
 import { Row } from '../components/Row'
 import { Spotlight } from '../components/Spotlight'
 import { TitleDetailModal } from '../components/TitleDetailModal'
@@ -28,9 +29,33 @@ function createLoadId(): string {
   return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20)}`
 }
 
-export function Discover() {
+interface DiscoverProps {
+  /** Movies / TV pages: keep only that media type's spotlights and row items. */
+  mediaType?: 'movie' | 'tv'
+  /** Home: show the personal Ready to watch / On the way sections. */
+  showActivity?: boolean
+}
+
+const PAGE_LABEL = { movie: 'Movies', tv: 'TV' } as const
+
+/** Home (and the Movies / TV pages): spotlight, personal activity, poster rows. */
+export function Discover({ mediaType, showActivity = false }: DiscoverProps = {}) {
   const [loadId] = useState(createLoadId)
-  const home = useDiscoverHome({ loadId })
+  const rawHome = useDiscoverHome({ loadId })
+  // Movies / TV reuse the one server-composed feed, filtered client-side: a row
+  // keeps only that media type's items and drops out when nothing is left.
+  const rawData = rawHome.data
+  const data = useMemo(() => {
+    if (!mediaType || !rawData) return rawData
+    return {
+      spotlights: rawData.spotlights.filter((item) => item.media_type === mediaType),
+      rows: rawData.rows
+        .map((row) => ({ ...row, items: row.items.filter((item) => item.media_type === mediaType) }))
+        .filter((row) => row.items.length > 0),
+    }
+  }, [mediaType, rawData])
+  const home = { ...rawHome, data }
+  const pageLabel = mediaType ? PAGE_LABEL[mediaType] : 'Home'
   // Every tile currently visible on this page — the compact live-state poll's
   // key set (issue #370 phase 2). Recomputed only when the underlying data
   // changes, not on every render, so the poll's query key stays stable.
@@ -59,13 +84,13 @@ export function Discover() {
     <div className="w-full">
       {home.isLoading ? (
         <div className="px-5 py-8 sm:px-8 lg:px-11">
-          <CenteredSpinner label="Loading Discover…" />
+          <CenteredSpinner label={`Loading ${pageLabel}…`} />
         </div>
       ) : home.isError ? (
         <div className="px-5 py-8 sm:px-8 lg:px-11">
           <StateMessage
             tone="error"
-            title="Couldn’t load Discover"
+            title={`Couldn’t load ${pageLabel}`}
             message={home.error.message}
             action={
               <button
@@ -88,6 +113,7 @@ export function Discover() {
             stateRevision={requestStateRevision}
             paused={modalOpen || searchOpen}
           />
+          {showActivity ? <ActivitySections onOpen={openTitle} /> : null}
           <div className="px-5 sm:px-8 lg:px-11">
             {(home.data?.rows ?? []).map((row) => (
               <Row

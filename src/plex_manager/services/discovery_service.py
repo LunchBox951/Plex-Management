@@ -29,7 +29,12 @@ from plex_manager.ports.metadata import (
 if TYPE_CHECKING:
     from collections.abc import Sequence
 
-    from plex_manager.ports.metadata import MediaSearchResult, MetadataPort
+    from plex_manager.ports.metadata import (
+        EpisodeInfo,
+        MediaSearchResult,
+        MetadataPort,
+        TvMetadata,
+    )
 
 # Upstream failures we tolerate per-row (a flaky/rate-limited TMDB): the row is an
 # honest empty row, retryable. ANY other exception is a bug and must surface.
@@ -45,6 +50,8 @@ __all__ = [
     "list_category",
     "search",
     "select_spotlights",
+    "tv_season_episodes",
+    "tv_show",
 ]
 
 _logger = logging.getLogger(__name__)
@@ -263,6 +270,19 @@ async def list_category(
     if category == "popular_tv":
         return await tmdb.popular_tv(page)
     return await tmdb.upcoming_movies(page)
+
+
+async def tv_show(tmdb: MetadataPort, tmdb_id: int) -> TvMetadata | None:
+    """Resolve a TV show for the request sheet's season tabs (``None`` if unknown)."""
+    return await tmdb.get_tv_show(tmdb_id)
+
+
+async def tv_season_episodes(
+    tmdb: MetadataPort, tmdb_id: int, season_number: int
+) -> list[EpisodeInfo]:
+    """Return one season's episodes, ascending by episode number."""
+    episodes = await tmdb.season_episodes(tmdb_id, season_number)
+    return sorted(episodes, key=lambda episode: episode.episode_number)
 
 
 def interleave_personalized_rows(

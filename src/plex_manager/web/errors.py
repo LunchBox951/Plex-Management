@@ -34,7 +34,7 @@ if TYPE_CHECKING:
     from starlette.requests import Request
     from starlette.responses import Response
 
-__all__ = ["AppError", "install_error_handlers"]
+__all__ = ["NOT_IMPLEMENTED_CODE", "AppError", "install_error_handlers"]
 
 _REDACTED: Final = "***"
 
@@ -61,6 +61,15 @@ _SECRET_REQUEST_FIELDS: Final[frozenset[str]] = frozenset(
         "password",
     }
 )
+
+# A planned feature whose backend has not landed yet (the UI-first overhaul ships
+# its screens ahead of some endpoints). The endpoint raises ``NotImplementedError``
+# and the SPA renders an honest "not available yet" state for this code instead of
+# a generic failure (north star #3: surface the state, never swallow it).
+NOT_IMPLEMENTED_CODE: Final = "not_implemented"
+_NOT_IMPLEMENTED_STATUS: Final = 501
+_NOT_IMPLEMENTED_MESSAGE: Final = "This feature isn't available yet."
+_NOT_IMPLEMENTED_HINT: Final = "It's planned but this server doesn't support it yet."
 
 # plex.tv / the Plex server gave an unusable answer during verification: an
 # honest, retryable upstream state, never an opaque 500 (north star #3).
@@ -284,6 +293,21 @@ async def _request_validation_error_handler(request: Request, exc: Exception) ->
     return JSONResponse(status_code=422, content={"detail": payload})
 
 
+async def _not_implemented_handler(request: Request, exc: Exception) -> Response:
+    """Render a ``NotImplementedError`` as a 501 ``not_implemented`` envelope.
+
+    The exception's own text, when given, is the user-facing message (e.g.
+    "Notifications aren't available yet."); otherwise a generic one is used.
+    """
+    message = str(exc).strip() or _NOT_IMPLEMENTED_MESSAGE
+    return _envelope(
+        status_code=_NOT_IMPLEMENTED_STATUS,
+        code=NOT_IMPLEMENTED_CODE,
+        message=message,
+        hint=_NOT_IMPLEMENTED_HINT,
+    )
+
+
 def install_error_handlers(app: FastAPI) -> None:
     """Register the envelope handlers for :class:`AppError` and ``PlexVerifyError``,
     plus the ONE composed ``RequestValidationError`` override: secret-field
@@ -292,4 +316,5 @@ def install_error_handlers(app: FastAPI) -> None:
     the 422 (see :func:`_request_validation_error_handler`)."""
     app.add_exception_handler(AppError, _app_error_handler)
     app.add_exception_handler(PlexVerifyError, _plex_verify_error_handler)
+    app.add_exception_handler(NotImplementedError, _not_implemented_handler)
     app.add_exception_handler(RequestValidationError, _request_validation_error_handler)

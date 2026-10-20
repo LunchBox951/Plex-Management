@@ -6,7 +6,7 @@ import logging
 from typing import TYPE_CHECKING, Annotated
 from uuid import UUID
 
-from fastapi import APIRouter, Depends, Query, Response
+from fastapi import APIRouter, Depends, HTTPException, Path, Query, Response, status
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from plex_manager.adapters.plex.library import PlexAuthError, PlexLibraryError
@@ -33,6 +33,10 @@ from plex_manager.web.schemas import (
     DiscoverListResponse,
     DiscoverResult,
     DiscoverSearchResponse,
+    ErrorDetail,
+    TvEpisodeItem,
+    TvSeasonEpisodesResponse,
+    TvShowSeasonsResponse,
 )
 
 if TYPE_CHECKING:
@@ -217,6 +221,45 @@ async def discover_home(
                 items=[_to_result(item, _state_for(states, item), present) for item in row.items],
             )
             for row in feed.rows
+        ],
+    )
+
+
+@router.get("/tv/{tmdb_id}/seasons", responses={404: {"model": ErrorDetail}})
+async def tv_show_seasons(
+    tmdb_id: int,
+    tmdb: Annotated[MetadataPort, Depends(get_tmdb)],
+) -> TvShowSeasonsResponse:
+    """Return a show's regular seasons for the TV request sheet's season tabs."""
+    show = await discovery_service.tv_show(tmdb, tmdb_id)
+    if show is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="media_not_found")
+    return TvShowSeasonsResponse(
+        tmdb_id=show.tmdb_id,
+        title=show.title,
+        seasons=list(range(1, show.season_count + 1)),
+    )
+
+
+@router.get("/tv/{tmdb_id}/seasons/{season_number}")
+async def tv_season_episodes(
+    tmdb_id: int,
+    season_number: Annotated[int, Path(ge=0)],
+    tmdb: Annotated[MetadataPort, Depends(get_tmdb)],
+) -> TvSeasonEpisodesResponse:
+    """Return one season's episodes for the TV request sheet.
+
+    Only ``episode_number`` and ``air_date`` are populated today; the richer
+    fields of :class:`TvEpisodeItem` stay ``None`` until the metadata port
+    carries them (the client renders a plain fallback).
+    """
+    episodes = await discovery_service.tv_season_episodes(tmdb, tmdb_id, season_number)
+    return TvSeasonEpisodesResponse(
+        tmdb_id=tmdb_id,
+        season_number=season_number,
+        episodes=[
+            TvEpisodeItem(episode_number=episode.episode_number, air_date=episode.air_date)
+            for episode in episodes
         ],
     )
 
