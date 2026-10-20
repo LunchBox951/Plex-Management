@@ -38,6 +38,13 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   design).
 
 ### Changed
+- Downloads: new grabs are held at metadata, and the full file list is
+  checked before any payload downloads. A release containing an executable,
+  script or installer, or no eligible video, is removed, blocklisted and
+  re-searched with a visible reason; healthy releases download their video
+  files only. Requires qBittorrent 5.0 or newer (WebAPI 2.11.0); older clients
+  fail setup validation and refuse new grabs rather than download unchecked.
+  Ships migration `609a01` and ADR-0031 (#609).
 - CI: parallelized the Python quality-gate test run, and eliminated pytest
   warnings under Python 3.12 and 3.14 (#543, #544).
 - Repo docs: archived the completed v1 planning docs under `docs/archive/`,
@@ -59,6 +66,7 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `vite`, and `vitest` dev dependencies (#581).
 
 ### Fixed
+- Entitlement captures now serialise each user's library read through its database commit across sign-in and background sweeps; a sweep skips a user whose sign-in capture is already in flight instead of waiting or probing the server. A fresh server-identity check after each read rejects replacement-server or unverified results while retaining the previous snapshot, never warms the shared library-section cache with an unverified read, and only verified, stored captures emit the canary scope telemetry. Sign-in remains responsive; owner-controlled server replacement is separate work (#572, #597).
 - Entitlement capture: the pre-init (first-owner claim) sign-in now reads its
   token ciphertext inside the transaction that wrote it, before the session
   commit, matching the token-rotation path. Read after the commit and without

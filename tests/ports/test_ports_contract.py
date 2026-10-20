@@ -189,6 +189,11 @@ class _FakeDownloadClient:
     async def list_files(self, info_hash: str) -> list[DownloadedFile]:
         return []
 
+    async def select_files(
+        self, info_hash: str, indices: Sequence[int], expected_files: Sequence[DownloadedFile]
+    ) -> None:
+        pass
+
     async def get_default_save_path(self) -> str | None:
         return None
 
@@ -294,7 +299,9 @@ class _LibraryMissingTriggerScan(LibraryPort):
     ) -> frozenset[tuple[int, Literal["movie", "tv"]]]:
         return frozenset()
 
-    async def list_sections(self, *, use_cache: bool = True) -> list[LibrarySection]:
+    async def list_sections(
+        self, *, use_cache: bool = True, write_cache: bool = True
+    ) -> list[LibrarySection]:
         return []
 
     async def watch_state(

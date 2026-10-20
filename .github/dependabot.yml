@@ -7,6 +7,10 @@ updates:
     groups:
       python-deps:
         patterns: ["*"]
+    ignore:
+      # The 2.1 migration is tracked in #615; remove this rule when it lands.
+      - dependency-name: sqlalchemy
+        update-types: ["version-update:semver-minor"]
 
   - package-ecosystem: github-actions
     directory: "/"

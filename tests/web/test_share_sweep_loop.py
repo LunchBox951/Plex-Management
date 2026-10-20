@@ -645,3 +645,179 @@ async def test_one_tick_captures_the_authorized_user_and_signs_out_the_revoked_o
         assert revoked.share_state == "share_revoked"
         # A capture is a snapshot of ACCESS; a user with none has nothing to capture.
         assert revoked.entitled_section_keys is None
+
+
+@pytest.mark.parametrize("identity_failure", ["replacement", "timeout"])
+async def test_sweep_rejects_a_server_change_after_a_later_users_section_read(
+    app: FastAPI, seed: SeedFn, identity_failure: str, caplog: pytest.LogCaptureFixture
+) -> None:
+    await seed(initialized=True)
+    await _configure_server(app)
+    user_ids = [
+        await _signed_in_user(app, username=f"viewer-{index}", token=f"viewer-token-{index}")
+        for index in range(3)
+    ]
+    previous_time = datetime.now(UTC) - timedelta(days=1)
+    async with app.state.sessionmaker() as session:
+        for user_id in user_ids:
+            user = await session.get(User, user_id)
+            assert user is not None
+            user.entitled_section_keys = ["old"]
+            user.entitlements_machine_id = _MACHINE_ID
+            user.entitlements_captured_at = previous_time
+        await session.commit()
+
+    second_read_finished = False
+    transport = _plex_tv_transport([_server_resource(_MACHINE_ID)], sections=_sections("1"))
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal second_read_finished
+        if request.url.path == "/identity" and second_read_finished:
+            if identity_failure == "timeout":
+                raise httpx.ReadTimeout("identity unavailable", request=request)
+            return httpx.Response(
+                200, json={"MediaContainer": {"machineIdentifier": "replacement-server"}}
+            )
+        if (
+            request.url.path == "/library/sections"
+            and request.headers.get("X-Plex-Token") == "viewer-token-1"
+        ):
+            second_read_finished = True
+            return httpx.Response(200, json=_sections("9"))
+        return await transport.handle_async_request(request)
+
+    await _use_transport(app, httpx.MockTransport(handler))
+    with caplog.at_level(logging.INFO):
+        assert await _tick(app) == 3
+    # Only the verified capture is a canary sample; the rejected read is not.
+    assert caplog.text.count("scope=") == 1
+    status = app.state.share_sweep_status
+    assert status.authorized == 3
+    assert status.captured == 1
+    assert status.capture_skipped == 2
+    assert status.capture_anchor_blocked == 2
+    assert status.signed_out == 0
+    assert status.state == (
+        "anchor_mismatch" if identity_failure == "replacement" else "anchor_unconfirmed"
+    )
+    async with app.state.sessionmaker() as session:
+        for index, user_id in enumerate(user_ids):
+            user = await session.get(User, user_id)
+            assert user is not None
+            assert user.entitled_section_keys == (["1"] if index == 0 else ["old"])
+            assert user.entitlements_machine_id == _MACHINE_ID
+            if index:
+                assert user.entitlements_captured_at == previous_time.replace(tzinfo=None)
+        assert await SettingsStore(session).get(PLEX_MACHINE_ID_SETTING) == _MACHINE_ID
+
+
+@pytest.mark.parametrize("identity_failure", ["replacement", "timeout"])
+async def test_a_failed_post_read_identity_check_defers_a_later_revocation_in_the_tick(
+    app: FastAPI, seed: SeedFn, identity_failure: str
+) -> None:
+    """The post-read probe gates share-loss verdicts too: plex.tv reports every
+    user revoked once the server is replaced, so the tick must not act on that."""
+    await seed(initialized=True)
+    await _configure_server(app)
+    kept_id = await _signed_in_user(app, username="kept", token="kept-token")  # noqa: S106
+    revoked_id = await _signed_in_user(app, username="revoked", token="revoked-token")  # noqa: S106
+    transport = _plex_tv_transport(
+        {
+            "kept-token": [_server_resource(_MACHINE_ID)],
+            "revoked-token": [_server_resource("some-other-server")],
+        },
+        sections=_sections("1"),
+    )
+    sections_read = False
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal sections_read
+        if request.url.path == "/identity" and sections_read:
+            if identity_failure == "timeout":
+                raise httpx.ReadTimeout("identity unavailable", request=request)
+            return httpx.Response(
+                200, json={"MediaContainer": {"machineIdentifier": "replacement-server"}}
+            )
+        if request.url.path == "/library/sections":
+            sections_read = True
+        return await transport.handle_async_request(request)
+
+    await _use_transport(app, httpx.MockTransport(handler))
+    # A deferred verdict is not a completed check.
+    assert await _tick(app) == 1
+
+    status = app.state.share_sweep_status
+    assert status.captured == 0
+    assert status.capture_anchor_blocked == 1
+    assert status.anchor_deferred == 1
+    assert status.signed_out == 0
+    assert status.state == (
+        "anchor_mismatch" if identity_failure == "replacement" else "anchor_unconfirmed"
+    )
+    assert await _live_sessions(app, kept_id) == 1
+    assert await _live_sessions(app, revoked_id) == 1
+    async with app.state.sessionmaker() as session:
+        kept = await session.get(User, kept_id)
+        assert kept is not None
+        assert kept.entitled_section_keys is None
+
+
+async def test_sweep_skips_a_user_whose_sign_in_capture_holds_the_lock(
+    app: FastAPI, seed: SeedFn
+) -> None:
+    """A sign-in capture in flight already carries that user's freshest evidence;
+    the tick counts the user as skipped instead of stalling behind its read."""
+    await seed(initialized=True)
+    await _configure_server(app)
+    user_ids = [
+        await _signed_in_user(app, username=f"viewer-{index}", token=f"viewer-token-{index}")
+        for index in range(3)
+    ]
+    held_id = user_ids[1]
+    await _use_transport(
+        app, _plex_tv_transport([_server_resource(_MACHINE_ID)], sections=_sections("1"))
+    )
+
+    async with asyncio.timeout(10), plex_access_service.entitlement_capture_slot(held_id):
+        assert await _tick(app) == 3
+
+    status = app.state.share_sweep_status
+    assert status.state == "ok"
+    assert status.authorized == 3
+    assert status.captured == 2
+    assert status.capture_skipped == 1
+    assert status.capture_anchor_blocked == 0
+    async with app.state.sessionmaker() as session:
+        for user_id in user_ids:
+            user = await session.get(User, user_id)
+            assert user is not None
+            assert user.entitled_section_keys == (None if user_id == held_id else ["1"])
+
+
+async def test_an_occupied_capture_slot_is_skipped_before_any_identity_probe(
+    app: FastAPI, seed: SeedFn
+) -> None:
+    """A skipped user must not pay for an identity probe, nor latch a failed one
+    that would mark the tick's anchor as unconfirmed."""
+    await seed(initialized=True)
+    await _configure_server(app)
+    held_id = await _signed_in_user(app)
+    identity_probes = 0
+    transport = _plex_tv_transport([_server_resource(_MACHINE_ID)], sections=_sections("1"))
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal identity_probes
+        if request.url.path == "/identity":
+            identity_probes += 1
+            raise httpx.ReadTimeout("identity unavailable", request=request)
+        return await transport.handle_async_request(request)
+
+    await _use_transport(app, httpx.MockTransport(handler))
+    async with asyncio.timeout(10), plex_access_service.entitlement_capture_slot(held_id):
+        assert await _tick(app) == 1
+
+    assert identity_probes == 0
+    status = app.state.share_sweep_status
+    assert status.state == "ok"
+    assert status.capture_skipped == 1
+    assert status.capture_anchor_blocked == 0

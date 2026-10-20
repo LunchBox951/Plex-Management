@@ -34,7 +34,11 @@ from collections.abc import Generator, Iterable, Iterator
 from pathlib import Path
 from typing import IO, NoReturn
 
-from plex_manager.domain.plex_video import is_plex_disc_structure_path, plex_video_extension
+from plex_manager.domain.plex_video import (
+    PLEX_EXTRAS_DIR_NAMES,
+    is_plex_disc_structure_path,
+    plex_video_extension,
+)
 from plex_manager.ports.filesystem import FilePublication, PublishedFileIdentity
 
 __all__ = ["LocalFileSystem", "LocalFileSystemError", "PartialDeleteError"]
@@ -61,12 +65,6 @@ _XATTR_ATTRIBUTE_TOLERATED_ERRNOS: frozenset[int] = frozenset(
 #: this is the same 1 MiB chunk the import pipeline used before the comparison moved
 #: behind the publish walk's descriptor.
 _DIGEST_CHUNK_BYTES = 1024 * 1024
-
-#: Lowercased directory names whose contents are bonus material, not the main
-#: feature — skipped entirely when picking the largest video.
-_EXTRAS_DIR_NAMES: frozenset[str] = frozenset(
-    {"featurettes", "extras", "trailers", "behind the scenes", "deleted scenes"}
-)
 
 
 class LocalFileSystemError(RuntimeError):
@@ -981,7 +979,7 @@ def _delete_containment_supported() -> bool:
     )
 
 
-def _iter_video_files(root: str) -> Iterator[tuple[str, int, str]]:
+def _iter_video_files(root: str, *, strict: bool = False) -> Iterator[tuple[str, int, str]]:
     """Walk directory ``root``, yielding every eligible video file: ``(abs, size, rel)``.
 
     Shared by :meth:`LocalFileSystem.largest_video_file` (directory case) and
@@ -1015,13 +1013,18 @@ def _iter_video_files(root: str) -> Iterator[tuple[str, int, str]]:
     parent_real = os.path.realpath(root_path.parent)
     if parent_real != os.sep and not _is_within(parent_real, root_real):
         return
-    for dirpath, dirnames, filenames in os.walk(root):
+
+    def scan_error(exc: OSError) -> None:
+        if strict:
+            raise exc
+
+    for dirpath, dirnames, filenames in os.walk(root, onerror=scan_error):
         # Prune extras / sample / optical-disc directories in place so os.walk
         # never offers their component streams as standalone import candidates.
         dirnames[:] = [
             name
             for name in dirnames
-            if name.casefold() not in _EXTRAS_DIR_NAMES
+            if name.casefold() not in PLEX_EXTRAS_DIR_NAMES
             and not is_plex_disc_structure_path(name)
             and "sample" not in name.casefold()
         ]
@@ -1038,6 +1041,8 @@ def _iter_video_files(root: str) -> Iterator[tuple[str, int, str]]:
             try:
                 size = os.path.getsize(candidate)
             except OSError:
+                if strict:
+                    raise
                 # A broken symlink or vanished file: skip it honestly rather
                 # than letting it abort the whole scan.
                 continue
@@ -1339,11 +1344,13 @@ class LocalFileSystem:
         of a season-pack's directory structure, not just the filename. Sample
         files, extras folders, and ``BDMV``/``VIDEO_TS`` optical-disc structures
         are skipped, mirroring :meth:`largest_video_file`. Returns an empty list
-        when no eligible video is found. Unlike :meth:`largest_video_file`,
+        when no eligible video is found. Directory and file-stat errors raise
+        ``OSError`` so an incomplete scan cannot prove a no-video payload.
+        Unlike :meth:`largest_video_file`,
         ``root`` being itself a single video file is not handled here -- a TV
         import always walks a directory.
         """
-        return list(_iter_video_files(root))
+        return list(_iter_video_files(root, strict=True))
 
     def _guarded_resolution(self, path: str) -> tuple[str, str] | None:
         """The shared resolve-and-check behind :meth:`resolve_guarded`,

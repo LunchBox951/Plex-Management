@@ -28,6 +28,7 @@ from plex_manager.adapters.qbittorrent.adapter import (
     QbittorrentAuthError,
     QbittorrentClient,
     QbittorrentError,
+    QbittorrentVersionError,
 )
 from plex_manager.adapters.service_url import InvalidServiceUrl, ServiceUrl
 from plex_manager.adapters.tmdb.adapter import TmdbApiError, TmdbAuthError, TmdbMetadata
@@ -455,6 +456,9 @@ async def validate_qbittorrent(
 ) -> ServiceValidateResponse:
     """Check qBittorrent + credentials by logging in and listing torrents.
 
+    A reachable client older than qBittorrent 5.0 fails validation too: every grab
+    would otherwise be refused at add time, after setup reported it healthy.
+
     ``download_mounts`` (default ``()``, no extra probe) opts into a SECOND,
     best-effort check (issues #133/#157): the client's GLOBAL default save path is
     read (``get_default_save_path``) and remapped through
@@ -474,9 +478,14 @@ async def validate_qbittorrent(
     try:
         adapter = QbittorrentClient(client, url, username, password)
         await adapter.get_all_statuses()
+        await adapter.require_payload_validation_support()
     except QbittorrentAuthError:
         return ServiceValidateResponse(
             ok=False, message="qBittorrent rejected the username or password."
+        )
+    except QbittorrentVersionError:
+        return ServiceValidateResponse(
+            ok=False, message="Plex Manager requires qBittorrent 5.0 or newer."
         )
     except QbittorrentError as exc:
         # The adapter wraps httpx transport/status errors into QbittorrentError so

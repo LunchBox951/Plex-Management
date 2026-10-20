@@ -138,6 +138,8 @@ async def test_qbittorrent_carries_a_note_when_its_default_save_path_is_invisibl
         path = request.url.path
         if path == "/api/v2/auth/login":
             return httpx.Response(200, text="Ok.")
+        if path == "/api/v2/app/webapiVersion":
+            return httpx.Response(200, text="2.11.0")
         if path == "/api/v2/torrents/info":
             return httpx.Response(200, json=[])
         if path == "/api/v2/app/preferences":
