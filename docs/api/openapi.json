@@ -745,6 +745,21 @@
           "tmdb_id": {
             "title": "Tmdb Id",
             "type": "integer"
+          },
+          "tv_mode": {
+            "anyOf": [
+              {
+                "enum": [
+                  "latest_season",
+                  "new_episodes"
+                ],
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Tv Mode"
           }
         },
         "required": [
@@ -1649,6 +1664,217 @@
           "dropped_count"
         ],
         "title": "LogsTailResponse",
+        "type": "object"
+      },
+      "MarkNotificationsReadBody": {
+        "description": "Mark notifications read: the listed ``ids``, or every one when omitted.",
+        "properties": {
+          "ids": {
+            "anyOf": [
+              {
+                "items": {
+                  "type": "integer"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Ids"
+          }
+        },
+        "title": "MarkNotificationsReadBody",
+        "type": "object"
+      },
+      "NotificationItem": {
+        "description": "One in-app notification for the current user (UI overhaul).",
+        "properties": {
+          "created_at": {
+            "format": "date-time",
+            "title": "Created At",
+            "type": "string"
+          },
+          "id": {
+            "title": "Id",
+            "type": "integer"
+          },
+          "kind": {
+            "enum": [
+              "help_requested",
+              "help_seen",
+              "fix_started",
+              "ready_to_watch",
+              "import_succeeded",
+              "import_failed",
+              "new_episode",
+              "request_created",
+              "service_down",
+              "service_recovered"
+            ],
+            "title": "Kind",
+            "type": "string"
+          },
+          "media_type": {
+            "anyOf": [
+              {
+                "enum": [
+                  "movie",
+                  "tv"
+                ],
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Media Type"
+          },
+          "message": {
+            "title": "Message",
+            "type": "string"
+          },
+          "note": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Note"
+          },
+          "poster_url": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Poster Url"
+          },
+          "read": {
+            "default": false,
+            "title": "Read",
+            "type": "boolean"
+          },
+          "request_id": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Request Id"
+          },
+          "title": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Title"
+          },
+          "tmdb_id": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Tmdb Id"
+          }
+        },
+        "required": [
+          "id",
+          "kind",
+          "message",
+          "created_at"
+        ],
+        "title": "NotificationItem",
+        "type": "object"
+      },
+      "NotificationListResponse": {
+        "description": "The current user's notifications, newest first, plus the unread count.",
+        "properties": {
+          "notifications": {
+            "items": {
+              "$ref": "#/components/schemas/NotificationItem"
+            },
+            "title": "Notifications",
+            "type": "array"
+          },
+          "unread_count": {
+            "title": "Unread Count",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "notifications",
+          "unread_count"
+        ],
+        "title": "NotificationListResponse",
+        "type": "object"
+      },
+      "NotifyAdminBody": {
+        "description": "``POST /requests/{id}/notify-admin`` -- \"Let the admin know\" (UI overhaul).\n\nSends the request's admins a notification that the requester needs help with\nit. ``note`` is an optional free-text message from the requester.",
+        "properties": {
+          "note": {
+            "anyOf": [
+              {
+                "maxLength": 500,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Note"
+          }
+        },
+        "title": "NotifyAdminBody",
+        "type": "object"
+      },
+      "NotifyAdminResponse": {
+        "description": "The state of a requester's \"Let the admin know\" on one request.",
+        "properties": {
+          "request_id": {
+            "title": "Request Id",
+            "type": "integer"
+          },
+          "seen_at": {
+            "anyOf": [
+              {
+                "format": "date-time",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Seen At"
+          },
+          "sent_at": {
+            "format": "date-time",
+            "title": "Sent At",
+            "type": "string"
+          }
+        },
+        "required": [
+          "request_id",
+          "sent_at"
+        ],
+        "title": "NotifyAdminResponse",
         "type": "object"
       },
       "PlexLibraryOption": {
@@ -3995,6 +4221,141 @@
         "title": "TmdbValidateRequest",
         "type": "object"
       },
+      "TvEpisodeItem": {
+        "description": "One episode in the request sheet.\n\n``episode_number`` and ``air_date`` come from TMDB today. ``name``,\n``overview``, ``still_url`` and ``runtime_minutes`` are part of the contract\nbut stay ``None`` until the metadata port carries them; ``in_library`` stays\n``None`` (unknown) until per-episode Plex presence is wired. The client\nrenders a plain fallback for every ``None``.",
+        "properties": {
+          "air_date": {
+            "anyOf": [
+              {
+                "format": "date",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Air Date"
+          },
+          "episode_number": {
+            "title": "Episode Number",
+            "type": "integer"
+          },
+          "in_library": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "In Library"
+          },
+          "name": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Name"
+          },
+          "overview": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Overview"
+          },
+          "runtime_minutes": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Runtime Minutes"
+          },
+          "still_url": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Still Url"
+          }
+        },
+        "required": [
+          "episode_number"
+        ],
+        "title": "TvEpisodeItem",
+        "type": "object"
+      },
+      "TvSeasonEpisodesResponse": {
+        "description": "One season's episodes, ascending.",
+        "properties": {
+          "episodes": {
+            "items": {
+              "$ref": "#/components/schemas/TvEpisodeItem"
+            },
+            "title": "Episodes",
+            "type": "array"
+          },
+          "season_number": {
+            "title": "Season Number",
+            "type": "integer"
+          },
+          "tmdb_id": {
+            "title": "Tmdb Id",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "tmdb_id",
+          "season_number",
+          "episodes"
+        ],
+        "title": "TvSeasonEpisodesResponse",
+        "type": "object"
+      },
+      "TvShowSeasonsResponse": {
+        "description": "A TV show's seasons, for the request sheet's season tabs.",
+        "properties": {
+          "seasons": {
+            "items": {
+              "type": "integer"
+            },
+            "title": "Seasons",
+            "type": "array"
+          },
+          "title": {
+            "title": "Title",
+            "type": "string"
+          },
+          "tmdb_id": {
+            "title": "Tmdb Id",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "tmdb_id",
+          "title",
+          "seasons"
+        ],
+        "title": "TvShowSeasonsResponse",
+        "type": "object"
+      },
       "UpdateActionRequest": {
         "additionalProperties": false,
         "description": "Bodyless public/internal action guard; arbitrary target fields are forbidden.",
@@ -5553,6 +5914,128 @@
         ]
       }
     },
+    "/api/v1/discover/tv/{tmdb_id}/seasons": {
+      "get": {
+        "description": "Return a show's regular seasons for the TV request sheet's season tabs.",
+        "operationId": "tv_show_seasons_api_v1_discover_tv__tmdb_id__seasons_get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "tmdb_id",
+            "required": true,
+            "schema": {
+              "title": "Tmdb Id",
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/TvShowSeasonsResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorDetail"
+                }
+              }
+            },
+            "description": "Not Found"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "security": [
+          {
+            "APIKeyHeader": []
+          },
+          {
+            "APIKeyCookie": []
+          }
+        ],
+        "summary": "Tv Show Seasons",
+        "tags": [
+          "discovery"
+        ]
+      }
+    },
+    "/api/v1/discover/tv/{tmdb_id}/seasons/{season_number}": {
+      "get": {
+        "description": "Return one season's episodes for the TV request sheet.\n\nOnly ``episode_number`` and ``air_date`` are populated today; the richer\nfields of :class:`TvEpisodeItem` stay ``None`` until the metadata port\ncarries them (the client renders a plain fallback).",
+        "operationId": "tv_season_episodes_api_v1_discover_tv__tmdb_id__seasons__season_number__get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "tmdb_id",
+            "required": true,
+            "schema": {
+              "title": "Tmdb Id",
+              "type": "integer"
+            }
+          },
+          {
+            "in": "path",
+            "name": "season_number",
+            "required": true,
+            "schema": {
+              "minimum": 0,
+              "title": "Season Number",
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/TvSeasonEpisodesResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "security": [
+          {
+            "APIKeyHeader": []
+          },
+          {
+            "APIKeyCookie": []
+          }
+        ],
+        "summary": "Tv Season Episodes",
+        "tags": [
+          "discovery"
+        ]
+      }
+    },
     "/api/v1/discover/{category}": {
       "get": {
         "description": "Return a paginated movie category (``trending`` / ``popular`` / ``upcoming``).",
@@ -6001,6 +6484,107 @@
         "summary": "Renew Endpoint",
         "tags": [
           "internal-updates"
+        ]
+      }
+    },
+    "/api/v1/notifications": {
+      "get": {
+        "description": "The current user's notifications, newest first, plus the unread count.",
+        "operationId": "list_notifications_endpoint_api_v1_notifications_get",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/NotificationListResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "501": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Not available yet"
+          }
+        },
+        "security": [
+          {
+            "APIKeyHeader": []
+          },
+          {
+            "APIKeyCookie": []
+          }
+        ],
+        "summary": "List Notifications Endpoint",
+        "tags": [
+          "notifications"
+        ]
+      }
+    },
+    "/api/v1/notifications/read": {
+      "post": {
+        "description": "Mark the listed notifications (or every one, when ``ids`` is omitted) read.",
+        "operationId": "mark_notifications_read_endpoint_api_v1_notifications_read_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/MarkNotificationsReadBody"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/NotificationListResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          },
+          "501": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Not available yet"
+          }
+        },
+        "security": [
+          {
+            "APIKeyHeader": []
+          },
+          {
+            "APIKeyCookie": [],
+            "CSRFHeader": []
+          }
+        ],
+        "summary": "Mark Notifications Read Endpoint",
+        "tags": [
+          "notifications"
         ]
       }
     },
@@ -6519,6 +7103,68 @@
         ]
       }
     },
+    "/api/v1/queue/{download_id}/force-import": {
+      "post": {
+        "description": "Admin \"Import anyway\": import a blocked download despite its mismatch.\n\nNot implemented yet -- answers 501 ``not_implemented`` (see\n``services.forced_import_service``). The UI confirms first and lists the side\neffects (wrong files may land under the requested season; the request is\nmarked done and not searched again; undo via Report a problem).",
+        "operationId": "force_import_endpoint_api_v1_queue__download_id__force_import_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "download_id",
+            "required": true,
+            "schema": {
+              "title": "Download Id",
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/QueueItem"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          },
+          "501": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Not available yet"
+          }
+        },
+        "security": [
+          {
+            "APIKeyHeader": []
+          },
+          {
+            "APIKeyCookie": [],
+            "CSRFHeader": []
+          }
+        ],
+        "summary": "Force Import Endpoint",
+        "tags": [
+          "queue"
+        ]
+      }
+    },
     "/api/v1/queue/{download_id}/import": {
       "post": {
         "description": "Operator retry: (re)run the import for a download (e.g. an ImportBlocked row).\n\nRequires Plex + qBittorrent configured (409 ``service_not_configured``\notherwise); the Movies/TV roots are each OPTIONAL here -- no upfront 409 for\neither. A download whose media type's root is unset gets its own honest,\nretryable ``ImportBlocked`` (surfaced in the returned ``QueueItem``, a normal\n200) instead of the endpoint refusing to even try, so an install with only\nONE root configured can still retry-import that type. The\ncorrection-without-a-terminal button for a blocked import.",
@@ -6867,7 +7513,7 @@
         ]
       },
       "post": {
-        "description": "Create a request (or return the existing active one for this media).\n\nIf Plex is configured and the movie is already in the library, the request is\nrecorded directly as ``available`` (no needless search/grab). For a tv\nrequest, ``body.seasons`` (omitted/empty = the whole aired series) is threaded\nto ``request_service.create_request``, which tracks each named season as its\nown ``SeasonRequest`` row -- including on the dedup path, where a repeat POST\nwith a NEW season list grows the tracked set rather than being dropped.\n\nRe-acquire (issue #131): ``body.force`` (movie-only) bypasses the\nalready-in-library short-circuit so a title Plex still reports present -- but\nwhose file was deleted/replaced out-of-band -- yields a fresh, grabbable\n``pending`` request instead of a terminal ``available`` one. Same authZ as any\ncreate; same response map (no new status codes) -- every dedup/ownership\nguard below still applies unchanged.",
+        "description": "Create a request (or return the existing active one for this media).\n\nIf Plex is configured and the movie is already in the library, the request is\nrecorded directly as ``available`` (no needless search/grab). For a tv\nrequest, ``body.seasons`` (omitted/empty = the whole aired series) is threaded\nto ``request_service.create_request``, which tracks each named season as its\nown ``SeasonRequest`` row -- including on the dedup path, where a repeat POST\nwith a NEW season list grows the tracked set rather than being dropped.\n\nRe-acquire (issue #131): ``body.force`` (movie-only) bypasses the\nalready-in-library short-circuit so a title Plex still reports present -- but\nwhose file was deleted/replaced out-of-band -- yields a fresh, grabbable\n``pending`` request instead of a terminal ``available`` one. Same authZ as any\ncreate; same response map (no new status codes) -- every dedup/ownership\nguard below still applies unchanged.\n\n``body.tv_mode`` (``latest_season`` / ``new_episodes``) is not implemented\nyet: any non-null value answers 501 ``not_implemented`` before anything is\nwritten (see ``services.tv_follow_service``).",
         "operationId": "create_request_endpoint_api_v1_requests_post",
         "requestBody": {
           "content": {
@@ -6919,6 +7565,16 @@
               }
             },
             "description": "Validation Error"
+          },
+          "501": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "A TV request mode (``tv_mode``) that isn't available yet"
           }
         },
         "security": [
@@ -7249,6 +7905,78 @@
           }
         ],
         "summary": "Keep Forever Endpoint",
+        "tags": [
+          "requests"
+        ]
+      }
+    },
+    "/api/v1/requests/{request_id}/notify-admin": {
+      "post": {
+        "description": "\"Let the admin know\": the requester asks the admins for help with a request.\n\nNot implemented yet -- answers 501 ``not_implemented`` (see\n``services.notification_service``).",
+        "operationId": "notify_admin_endpoint_api_v1_requests__request_id__notify_admin_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "request_id",
+            "required": true,
+            "schema": {
+              "title": "Request Id",
+              "type": "integer"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/NotifyAdminBody"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/NotifyAdminResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          },
+          "501": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Not available yet"
+          }
+        },
+        "security": [
+          {
+            "APIKeyHeader": []
+          },
+          {
+            "APIKeyCookie": [],
+            "CSRFHeader": []
+          }
+        ],
+        "summary": "Notify Admin Endpoint",
         "tags": [
           "requests"
         ]

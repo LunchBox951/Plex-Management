@@ -19,7 +19,12 @@ from plex_manager.ports.repositories import DownloadRecord, RequestRecord
 from plex_manager.repositories.downloads import SqlDownloadRepository
 from plex_manager.repositories.season_episode_states import SqlSeasonEpisodeStateRepository
 from plex_manager.repositories.season_requests import SqlSeasonRequestRepository
-from plex_manager.services import correction_service, request_service
+from plex_manager.services import (
+    correction_service,
+    notification_service,
+    request_service,
+    tv_follow_service,
+)
 from plex_manager.services.correction_service import (
     ActiveDuplicateError,
     DownloadClientRequiredError,
@@ -63,6 +68,8 @@ from plex_manager.web.schemas import (
     ErrorDetail,
     ErrorEnvelope,
     KeepForeverBody,
+    NotifyAdminBody,
+    NotifyAdminResponse,
     ReportIssueBody,
     RequestListResponse,
     RequestResponse,
@@ -88,6 +95,14 @@ router = APIRouter(
 _CREATE_REQUEST_RESPONSES: dict[int | str, dict[str, Any]] = {
     200: {"model": RequestResponse, "description": "Existing matching request"},
     404: {"model": ErrorDetail, "description": "Media not found"},
+    501: {
+        "model": ErrorEnvelope,
+        "description": "A TV request mode (``tv_mode``) that isn't available yet",
+    },
+}
+
+_NOT_IMPLEMENTED_RESPONSES: dict[int | str, dict[str, Any]] = {
+    501: {"model": ErrorEnvelope, "description": "Not available yet"},
 }
 
 # The ONE download state whose ``progress`` is a live transfer percentage. Every
@@ -419,7 +434,15 @@ async def create_request_endpoint(
     ``pending`` request instead of a terminal ``available`` one. Same authZ as any
     create; same response map (no new status codes) -- every dedup/ownership
     guard below still applies unchanged.
+
+    ``body.tv_mode`` (``latest_season`` / ``new_episodes``) is not implemented
+    yet: any non-null value answers 501 ``not_implemented`` before anything is
+    written (see ``services.tv_follow_service``).
     """
+    if body.media_type == "tv" and body.tv_mode is not None:
+        await tv_follow_service.create_follow_request(
+            session, tmdb, tmdb_id=body.tmdb_id, mode=body.tv_mode, user_id=auth.user_id
+        )
     try:
         result = await request_service.create_request_result(
             session,
@@ -759,6 +782,23 @@ async def get_request_endpoint(
         is_owner=_is_owner(auth, record),
         can_withdraw=can_withdraw,
         has_other_participants=has_other_participants,
+    )
+
+
+@router.post("/{request_id}/notify-admin", responses=_NOT_IMPLEMENTED_RESPONSES)
+async def notify_admin_endpoint(
+    request_id: int,
+    body: NotifyAdminBody,
+    auth: Annotated[AuthContext, Depends(require_api_key)],
+    session: Annotated[AsyncSession, Depends(get_session)],
+) -> NotifyAdminResponse:
+    """ "Let the admin know": the requester asks the admins for help with a request.
+
+    Not implemented yet -- answers 501 ``not_implemented`` (see
+    ``services.notification_service``).
+    """
+    await notification_service.notify_admin(
+        session, request_id=request_id, user_id=auth.user_id, note=body.note
     )
 
 

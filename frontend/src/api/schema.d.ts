@@ -321,6 +321,50 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/v1/discover/tv/{tmdb_id}/seasons": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Tv Show Seasons
+         * @description Return a show's regular seasons for the TV request sheet's season tabs.
+         */
+        get: operations["tv_show_seasons_api_v1_discover_tv__tmdb_id__seasons_get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/discover/tv/{tmdb_id}/seasons/{season_number}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Tv Season Episodes
+         * @description Return one season's episodes for the TV request sheet.
+         *
+         *     Only ``episode_number`` and ``air_date`` are populated today; the richer
+         *     fields of :class:`TvEpisodeItem` stay ``None`` until the metadata port
+         *     carries them (the client renders a plain fallback).
+         */
+        get: operations["tv_season_episodes_api_v1_discover_tv__tmdb_id__seasons__season_number__get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/v1/discover/{category}": {
         parameters: {
             query?: never;
@@ -499,6 +543,46 @@ export interface paths {
         put?: never;
         /** Renew Endpoint */
         post: operations["renew_endpoint_api_v1_internal_updates_renew_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/notifications": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * List Notifications Endpoint
+         * @description The current user's notifications, newest first, plus the unread count.
+         */
+        get: operations["list_notifications_endpoint_api_v1_notifications_get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/notifications/read": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Mark Notifications Read Endpoint
+         * @description Mark the listed notifications (or every one, when ``ids`` is omitted) read.
+         */
+        post: operations["mark_notifications_read_endpoint_api_v1_notifications_read_post"];
         delete?: never;
         options?: never;
         head?: never;
@@ -773,6 +857,31 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/v1/queue/{download_id}/force-import": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Force Import Endpoint
+         * @description Admin "Import anyway": import a blocked download despite its mismatch.
+         *
+         *     Not implemented yet -- answers 501 ``not_implemented`` (see
+         *     ``services.forced_import_service``). The UI confirms first and lists the side
+         *     effects (wrong files may land under the requested season; the request is
+         *     marked done and not searched again; undo via Report a problem).
+         */
+        post: operations["force_import_endpoint_api_v1_queue__download_id__force_import_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/v1/queue/{download_id}/import": {
         parameters: {
             query?: never;
@@ -911,6 +1020,10 @@ export interface paths {
          *     ``pending`` request instead of a terminal ``available`` one. Same authZ as any
          *     create; same response map (no new status codes) -- every dedup/ownership
          *     guard below still applies unchanged.
+         *
+         *     ``body.tv_mode`` (``latest_season`` / ``new_episodes``) is not implemented
+         *     yet: any non-null value answers 501 ``not_implemented`` before anything is
+         *     written (see ``services.tv_follow_service``).
          */
         post: operations["create_request_endpoint_api_v1_requests_post"];
         delete?: never;
@@ -1064,6 +1177,29 @@ export interface paths {
          *     ever moves their own rows, never another user's eviction protection.
          */
         post: operations["keep_forever_endpoint_api_v1_requests__request_id__keep_forever_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/requests/{request_id}/notify-admin": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Notify Admin Endpoint
+         * @description "Let the admin know": the requester asks the admins for help with a request.
+         *
+         *     Not implemented yet -- answers 501 ``not_implemented`` (see
+         *     ``services.notification_service``).
+         */
+        post: operations["notify_admin_endpoint_api_v1_requests__request_id__notify_admin_post"];
         delete?: never;
         options?: never;
         head?: never;
@@ -2131,6 +2267,8 @@ export interface components {
             seasons?: number[] | null;
             /** Tmdb Id */
             tmdb_id: number;
+            /** Tv Mode */
+            tv_mode?: ("latest_season" | "new_episodes") | null;
         };
         /**
          * DiscoverHomeResponse
@@ -2573,6 +2711,87 @@ export interface components {
             dropped_count: number;
             /** Events */
             events: components["schemas"]["LiveLogRecordItem"][];
+        };
+        /**
+         * MarkNotificationsReadBody
+         * @description Mark notifications read: the listed ``ids``, or every one when omitted.
+         */
+        MarkNotificationsReadBody: {
+            /** Ids */
+            ids?: number[] | null;
+        };
+        /**
+         * NotificationItem
+         * @description One in-app notification for the current user (UI overhaul).
+         */
+        NotificationItem: {
+            /**
+             * Created At
+             * Format: date-time
+             */
+            created_at: string;
+            /** Id */
+            id: number;
+            /**
+             * Kind
+             * @enum {string}
+             */
+            kind: "help_requested" | "help_seen" | "fix_started" | "ready_to_watch" | "import_succeeded" | "import_failed" | "new_episode" | "request_created" | "service_down" | "service_recovered";
+            /** Media Type */
+            media_type?: ("movie" | "tv") | null;
+            /** Message */
+            message: string;
+            /** Note */
+            note?: string | null;
+            /** Poster Url */
+            poster_url?: string | null;
+            /**
+             * Read
+             * @default false
+             */
+            read: boolean;
+            /** Request Id */
+            request_id?: number | null;
+            /** Title */
+            title?: string | null;
+            /** Tmdb Id */
+            tmdb_id?: number | null;
+        };
+        /**
+         * NotificationListResponse
+         * @description The current user's notifications, newest first, plus the unread count.
+         */
+        NotificationListResponse: {
+            /** Notifications */
+            notifications: components["schemas"]["NotificationItem"][];
+            /** Unread Count */
+            unread_count: number;
+        };
+        /**
+         * NotifyAdminBody
+         * @description ``POST /requests/{id}/notify-admin`` -- "Let the admin know" (UI overhaul).
+         *
+         *     Sends the request's admins a notification that the requester needs help with
+         *     it. ``note`` is an optional free-text message from the requester.
+         */
+        NotifyAdminBody: {
+            /** Note */
+            note?: string | null;
+        };
+        /**
+         * NotifyAdminResponse
+         * @description The state of a requester's "Let the admin know" on one request.
+         */
+        NotifyAdminResponse: {
+            /** Request Id */
+            request_id: number;
+            /** Seen At */
+            seen_at?: string | null;
+            /**
+             * Sent At
+             * Format: date-time
+             */
+            sent_at: string;
         };
         /**
          * PlexLibraryOption
@@ -3492,6 +3711,56 @@ export interface components {
             api_key: string;
         };
         /**
+         * TvEpisodeItem
+         * @description One episode in the request sheet.
+         *
+         *     ``episode_number`` and ``air_date`` come from TMDB today. ``name``,
+         *     ``overview``, ``still_url`` and ``runtime_minutes`` are part of the contract
+         *     but stay ``None`` until the metadata port carries them; ``in_library`` stays
+         *     ``None`` (unknown) until per-episode Plex presence is wired. The client
+         *     renders a plain fallback for every ``None``.
+         */
+        TvEpisodeItem: {
+            /** Air Date */
+            air_date?: string | null;
+            /** Episode Number */
+            episode_number: number;
+            /** In Library */
+            in_library?: boolean | null;
+            /** Name */
+            name?: string | null;
+            /** Overview */
+            overview?: string | null;
+            /** Runtime Minutes */
+            runtime_minutes?: number | null;
+            /** Still Url */
+            still_url?: string | null;
+        };
+        /**
+         * TvSeasonEpisodesResponse
+         * @description One season's episodes, ascending.
+         */
+        TvSeasonEpisodesResponse: {
+            /** Episodes */
+            episodes: components["schemas"]["TvEpisodeItem"][];
+            /** Season Number */
+            season_number: number;
+            /** Tmdb Id */
+            tmdb_id: number;
+        };
+        /**
+         * TvShowSeasonsResponse
+         * @description A TV show's seasons, for the request sheet's season tabs.
+         */
+        TvShowSeasonsResponse: {
+            /** Seasons */
+            seasons: number[];
+            /** Title */
+            title: string;
+            /** Tmdb Id */
+            tmdb_id: number;
+        };
+        /**
          * UpdateActionRequest
          * @description Bodyless public/internal action guard; arbitrary target fields are forbidden.
          */
@@ -4193,6 +4462,78 @@ export interface operations {
             };
         };
     };
+    tv_show_seasons_api_v1_discover_tv__tmdb_id__seasons_get: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                tmdb_id: number;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["TvShowSeasonsResponse"];
+                };
+            };
+            /** @description Not Found */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorDetail"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    tv_season_episodes_api_v1_discover_tv__tmdb_id__seasons__season_number__get: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                tmdb_id: number;
+                season_number: number;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["TvSeasonEpisodesResponse"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
     discover_category_api_v1_discover__category__get: {
         parameters: {
             query?: {
@@ -4477,6 +4818,77 @@ export interface operations {
             };
         };
     };
+    list_notifications_endpoint_api_v1_notifications_get: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["NotificationListResponse"];
+                };
+            };
+            /** @description Not available yet */
+            501: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+        };
+    };
+    mark_notifications_read_endpoint_api_v1_notifications_read_post: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["MarkNotificationsReadBody"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["NotificationListResponse"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+            /** @description Not available yet */
+            501: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+        };
+    };
     disk_endpoint_api_v1_ops_disk_get: {
         parameters: {
             query?: never;
@@ -4729,6 +5141,46 @@ export interface operations {
             };
         };
     };
+    force_import_endpoint_api_v1_queue__download_id__force_import_post: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                download_id: number;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["QueueItem"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+            /** @description Not available yet */
+            501: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+        };
+    };
     import_endpoint_api_v1_queue__download_id__import_post: {
         parameters: {
             query?: never;
@@ -4962,6 +5414,15 @@ export interface operations {
                     "application/json": components["schemas"]["HTTPValidationError"];
                 };
             };
+            /** @description A TV request mode (``tv_mode``) that isn't available yet */
+            501: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
         };
     };
     requests_by_title_endpoint_api_v1_requests_by_title_get: {
@@ -5149,6 +5610,50 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    notify_admin_endpoint_api_v1_requests__request_id__notify_admin_post: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                request_id: number;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["NotifyAdminBody"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["NotifyAdminResponse"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+            /** @description Not available yet */
+            501: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
                 };
             };
         };

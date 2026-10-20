@@ -9,7 +9,7 @@ Prowlarr / TMDB api keys, qBittorrent password) are represented by a masked
 from __future__ import annotations
 
 import re
-from datetime import datetime
+from datetime import date, datetime
 from typing import Any, Literal, cast
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
@@ -67,6 +67,11 @@ __all__ = [
     "LogEventItem",
     "LogsResponse",
     "LogsTailResponse",
+    "MarkNotificationsReadBody",
+    "NotificationItem",
+    "NotificationListResponse",
+    "NotifyAdminBody",
+    "NotifyAdminResponse",
     "PlexLibraryOption",
     "PlexServerConnection",
     "PlexServerOption",
@@ -98,6 +103,10 @@ __all__ = [
     "SubsystemHealthItem",
     "TileKey",
     "TmdbValidateRequest",
+    "TvEpisodeItem",
+    "TvRequestModeField",
+    "TvSeasonEpisodesResponse",
+    "TvShowSeasonsResponse",
     "UpdateActionRequest",
     "UpdateClaimRequest",
     "UpdateClaimResponse",
@@ -113,6 +122,12 @@ __all__ = [
 ]
 
 MediaTypeField = Literal["movie", "tv"]
+
+# TV-only request modes beyond explicit seasons/episodes (UI overhaul). ``latest_season``
+# asks for the newest season only, once; ``new_episodes`` follows the show from now on
+# with no backfill. Accepted on the wire so the client contract is stable; the create
+# endpoint raises ``NotImplementedError`` (501) until the backend lands them.
+TvRequestModeField = Literal["latest_season", "new_episodes"]
 
 # The library-state a Discover/Search tile is decorated with (issue #29). The SERVER
 # base state: presence (from Plex) folded with the request-store status. Kept in sync
@@ -1432,6 +1447,127 @@ class CreateRequestBody(BaseModel):
     # (see ``CreateRequestBody`` in the generated ``schema.d.ts``), which would
     # break every existing caller that omits this field entirely.
     force: bool | None = None
+    # TV only: a follow-style request mode (see ``TvRequestModeField``). When set,
+    # ``seasons``/``episodes`` are ignored. Not implemented yet: the create endpoint
+    # answers 501 ``not_implemented`` for any non-null value.
+    tv_mode: TvRequestModeField | None = None
+
+
+class NotifyAdminBody(BaseModel):
+    """``POST /requests/{id}/notify-admin`` -- "Let the admin know" (UI overhaul).
+
+    Sends the request's admins a notification that the requester needs help with
+    it. ``note`` is an optional free-text message from the requester.
+    """
+
+    model_config = ConfigDict(frozen=True)
+
+    note: str | None = Field(default=None, max_length=500)
+
+
+class NotifyAdminResponse(BaseModel):
+    """The state of a requester's "Let the admin know" on one request."""
+
+    model_config = ConfigDict(frozen=True)
+
+    request_id: int
+    sent_at: datetime
+    # When an admin first opened the notification; ``None`` until then. Drives the
+    # requester's "The admin knows" state.
+    seen_at: datetime | None = None
+
+
+NotificationKind = Literal[
+    "help_requested",
+    "help_seen",
+    "fix_started",
+    "ready_to_watch",
+    "import_succeeded",
+    "import_failed",
+    "new_episode",
+    "request_created",
+    "service_down",
+    "service_recovered",
+]
+
+
+class NotificationItem(BaseModel):
+    """One in-app notification for the current user (UI overhaul)."""
+
+    model_config = ConfigDict(frozen=True)
+
+    id: int
+    kind: NotificationKind
+    # One sentence, plain words; the client bolds nothing itself.
+    message: str
+    created_at: datetime
+    read: bool = False
+    request_id: int | None = None
+    tmdb_id: int | None = None
+    media_type: MediaTypeField | None = None
+    title: str | None = None
+    poster_url: str | None = None
+    # Optional free text attached by a person (e.g. the requester's note).
+    note: str | None = None
+
+
+class NotificationListResponse(BaseModel):
+    """The current user's notifications, newest first, plus the unread count."""
+
+    model_config = ConfigDict(frozen=True)
+
+    notifications: list[NotificationItem]
+    unread_count: int
+
+
+class MarkNotificationsReadBody(BaseModel):
+    """Mark notifications read: the listed ``ids``, or every one when omitted."""
+
+    model_config = ConfigDict(frozen=True)
+
+    ids: list[int] | None = None
+
+
+class TvShowSeasonsResponse(BaseModel):
+    """A TV show's seasons, for the request sheet's season tabs."""
+
+    model_config = ConfigDict(frozen=True)
+
+    tmdb_id: int
+    title: str
+    # Regular seasons, ascending (specials -- season 0 -- excluded).
+    seasons: list[int]
+
+
+class TvEpisodeItem(BaseModel):
+    """One episode in the request sheet.
+
+    ``episode_number`` and ``air_date`` come from TMDB today. ``name``,
+    ``overview``, ``still_url`` and ``runtime_minutes`` are part of the contract
+    but stay ``None`` until the metadata port carries them; ``in_library`` stays
+    ``None`` (unknown) until per-episode Plex presence is wired. The client
+    renders a plain fallback for every ``None``.
+    """
+
+    model_config = ConfigDict(frozen=True)
+
+    episode_number: int
+    air_date: date | None = None
+    name: str | None = None
+    overview: str | None = None
+    still_url: str | None = None
+    runtime_minutes: int | None = None
+    in_library: bool | None = None
+
+
+class TvSeasonEpisodesResponse(BaseModel):
+    """One season's episodes, ascending."""
+
+    model_config = ConfigDict(frozen=True)
+
+    tmdb_id: int
+    season_number: int
+    episodes: list[TvEpisodeItem]
 
 
 class ReportIssueBody(BaseModel):
