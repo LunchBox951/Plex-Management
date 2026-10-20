@@ -122,7 +122,8 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Security
 - Bumped Mako to 1.4.2 (#614) and then 1.4.3 (#656), resolving GHSA-5639-2j2p-m4mx (medium: a drive-letter URI could bypass `TemplateLookup`'s directory-traversal check on Windows). Mako is used only by Alembic's revision template and the container runs Linux, so this is a supply-chain hygiene bump rather than an exploitable path here.
-- Bumped the `wolfi-base` container base image digest `57108e5` → `918a593` (#590) → `9a8d954` (#599) → `c2a4815` (#621).
+- Bumped the `wolfi-base` container base image digest `57108e5` → `918a593` (#590) → `9a8d954` (#599) → `c2a4815` (#621) → `d68b2b1`.
+- Moved the container's ffprobe source from `ffmpeg-8.1=8.1.2-r2` to `ffmpeg-9.0=9.0.2-r3`, resolving CVE-2026-64830, CVE-2026-64833, CVE-2026-64834, CVE-2026-64835, CVE-2026-66036, CVE-2026-66039, CVE-2026-66040, CVE-2026-75142, CVE-2026-75146, and CVE-2026-75147 (high, 80 Trivy findings across the ffmpeg 8.1 library packages). Wolfi has not published the 8.1.3 fix, so the 1.1.0 candidate moves to the 9.0 series. The adapter's exact ffprobe arguments produce the same exit codes and JSON shape on 9.0.2 as on 8.1.2.
 - Bumped the container's `python-3.14` APK pin from 3.14.6-r4 to 3.14.7-r4,
   resolving CVE-2025-15366 (medium, `imaplib`) and CVE-2026-6879 (low, XML
   parsing) reported by Trivy against the `:edge` image. The app imports
