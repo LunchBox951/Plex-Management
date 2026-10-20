@@ -10,6 +10,7 @@ through real ``httpx.MockTransport`` responses so the two stay wired together.
 
 from __future__ import annotations
 
+import logging
 from collections.abc import Awaitable, Callable, Iterator
 from datetime import UTC, datetime, timedelta
 
@@ -1916,7 +1917,7 @@ async def test_a_rotated_token_mid_sweep_discards_that_users_capture(
 
 
 async def test_a_rotation_between_verdict_and_capture_write_is_refused(
-    sessionmaker_: SessionMaker,
+    sessionmaker_: SessionMaker, caplog: pytest.LogCaptureFixture
 ) -> None:
     """The sweep's capture must present the ciphertext of the credential its
     library client is BOUND to -- the one read when the candidate was selected --
@@ -1978,14 +1979,17 @@ async def test_a_rotation_between_verdict_and_capture_write_is_refused(
 
     plex_access_service._attempt_capture = rotating_attempt  # pyright: ignore[reportPrivateUsage, reportAttributeAccessIssue]
     try:
-        result = await _sweep(sessionmaker_, [_server_resource(_MACHINE_ID)], capture=context)
+        with caplog.at_level(logging.INFO, logger="plex_manager.services.plex_access_service"):
+            result = await _sweep(sessionmaker_, [_server_resource(_MACHINE_ID)], capture=context)
     finally:
         plex_access_service._attempt_capture = original_attempt  # pyright: ignore[reportPrivateUsage]
 
-    # The verdict landed; the stale-credential snapshot did not.
+    # The verdict landed; the stale-credential snapshot did not, and a refused
+    # write is not a canary sample.
     assert result.authorized == 1
     assert result.captured == 0
     assert result.capture_failed == 1
+    assert "scope=" not in caplog.text
     user = await _load(sessionmaker_, user_id)
     assert user.entitled_section_keys is None
     assert user.encrypted_plex_token == "rotated-by-a-sign-in"  # noqa: S105

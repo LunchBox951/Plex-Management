@@ -631,8 +631,10 @@ class FakeLibrary:
         self.scanned.append(path)
         self.scan_calls.append((path, media_type))
 
-    async def list_sections(self, *, use_cache: bool = True) -> list[LibrarySection]:
-        del use_cache  # the fake has no cache to bypass
+    async def list_sections(
+        self, *, use_cache: bool = True, write_cache: bool = True
+    ) -> list[LibrarySection]:
+        del use_cache, write_cache  # the fake has no cache to bypass
         return list(self.sections)
 
     async def watch_state(
