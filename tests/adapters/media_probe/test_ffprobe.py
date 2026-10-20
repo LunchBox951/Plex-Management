@@ -284,6 +284,19 @@ def test_nonzero_ffprobe_exit_on_unreadable_candidate_is_unavailable(
         FfprobeMediaProbe().probe(tmp_path / "vanished.mkv")
 
 
+@pytest.mark.parametrize("returncode", [126, 127])
+def test_ffprobe_that_cannot_run_is_unavailable_on_a_readable_candidate(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, returncode: int
+) -> None:
+    _stub_run(monkeypatch, _completed({}, returncode=returncode))
+    candidate = tmp_path / "movie.mkv"
+    candidate.write_bytes(b"readable bytes")
+
+    with pytest.raises(MediaProbeUnavailableError) as raised:
+        FfprobeMediaProbe().probe(candidate)
+    assert str(raised.value) == f"ffprobe could not run (exit {returncode})"
+
+
 def test_signal_terminated_ffprobe_is_unavailable(monkeypatch: pytest.MonkeyPatch) -> None:
     _stub_run(monkeypatch, _completed({}, returncode=-9))
 
