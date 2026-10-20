@@ -24,7 +24,10 @@ from typing import TYPE_CHECKING, Final
 
 from sqlalchemy.exc import IntegrityError
 
-from plex_manager.domain.payload_validation import is_unstarted_held_torrent
+from plex_manager.domain.payload_validation import (
+    HELD_METADATA_STATES,
+    is_unstarted_held_torrent,
+)
 from plex_manager.domain.reconciler import METADATA_STALL_WINDOW
 from plex_manager.domain.state_machine import TERMINAL_STATES, DownloadState
 from plex_manager.logsafe import safe_int, safe_text
@@ -270,7 +273,9 @@ async def _is_untracked_held_orphan(qbt: DownloadClientPort, torrent_hash: str) 
     status = await qbt.get_status(torrent_hash)
     if status is None:
         return False
-    has_manifest = bool(await qbt.list_files(torrent_hash))
+    has_manifest = status.raw_state not in HELD_METADATA_STATES and bool(
+        await qbt.list_files(torrent_hash)
+    )
     return is_unstarted_held_torrent(status.raw_state, status.progress, has_manifest=has_manifest)
 
 

@@ -26,6 +26,6 @@ That shape is the app's own held add from the crashed grab, and the current grab
 
 A regrab of a release whose earlier grab crashed after the add now downloads it after validation, instead of leaving it silently stopped. A client read failure during this check propagates as the same client error an add failure raises, so the grab records no row instead of guessing ownership.
 
-An operator's identical, deliberately stopped copy of the same release at zero progress would be started by a grab of that release. The match is narrow enough that this is accepted.
+An operator's identical, deliberately stopped copy of the same release at zero progress would be started by a grab of that release. A metadata-fetching torrent is assumed to carry the app's stop-at-metadata hold; one added without it, by an older version or by the operator, could transfer payload bytes before validation stops it, where ADR-0031 would have removed and regrabbed it. The match is narrow enough that both are accepted.
 
 This does not recover client-only torrents for a release that is never regrabbed, add durable pre-add intent (ADR-0029/0030), or add the Adopt and Remove controls; those remain #481's scope.
