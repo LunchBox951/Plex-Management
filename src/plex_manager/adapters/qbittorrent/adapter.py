@@ -1015,6 +1015,7 @@ def _torrent_to_status(torrent: dict[str, object]) -> DownloadStatus:
         seeding_time_limit_minutes=_i(torrent.get("seeding_time_limit"), -2),
         inactive_seeding_time_limit_minutes=_i(torrent.get("inactive_seeding_time_limit"), -2),
         last_activity_unix=_i(torrent.get("last_activity")),
+        force_start=torrent.get("force_start") is True,
     )
 
 
@@ -1629,6 +1630,19 @@ class QbittorrentClient:
         """Resume (qBit 4.x) / start (qBit 5.x) the torrent ``info_hash``."""
         path = "/torrents/start" if await self._use_stop_start() else "/torrents/resume"
         response = await self._request("POST", path, data={"hashes": info_hash.lower()})
+        self._raise_for_status(response)
+
+    async def force_start(self, info_hash: str) -> None:
+        """Start ``info_hash`` in forced mode through ``/torrents/setForceStart``.
+
+        qBittorrent applies ``value=true`` as a start in forced mode on both 4.x and
+        5.x, so this also starts a stopped torrent; no separate start is needed.
+        """
+        response = await self._request(
+            "POST",
+            "/torrents/setForceStart",
+            data={"hashes": info_hash.lower(), "value": "true"},
+        )
         self._raise_for_status(response)
 
     async def remove(self, info_hash: str, *, delete_files: bool) -> None:

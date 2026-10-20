@@ -161,6 +161,7 @@ class DownloadRecord(BaseModel):
     failed_reason: str | None = None
     payload_pending: bool = False
     payload_resume: bool = False
+    payload_force_start: bool = False
     payload_rejection: str | None = None
     # Consecutive resumed-import probe-outage retries (``downloads.retry_count``,
     # issue #180) -- see ``services.import_service._refresh_resumed_import_after_probe_outage``

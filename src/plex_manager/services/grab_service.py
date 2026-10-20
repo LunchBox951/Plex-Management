@@ -391,6 +391,7 @@ async def _reuse_terminal_row(
         retry_count=0,
         payload_pending=payload_pending,
         payload_resume=payload_resume,
+        payload_force_start=False,
         clear_payload_rejection=True,
     )
     if not claimed:
