@@ -121,6 +121,7 @@ def _to_record(row: Download, scopes: list[DownloadScopeRecord] | None = None) -
         failed_reason=row.failed_reason,
         payload_pending=row.payload_pending,
         payload_resume=row.payload_resume,
+        payload_force_start=row.payload_force_start,
         payload_rejection=row.payload_rejection,
         retry_count=row.retry_count,
         first_seen_at=_as_utc(row.first_seen_at),
@@ -1165,6 +1166,7 @@ class SqlDownloadRepository:
         retry_count: int | None = None,
         payload_pending: bool | None = None,
         payload_resume: bool | None = None,
+        payload_force_start: bool | None = None,
         payload_rejection: str | None = None,
         clear_payload_rejection: bool = False,
         require_failed_reason: str | _NoReasonPredicate | None = NO_REASON_PREDICATE,
@@ -1248,6 +1250,8 @@ class SqlDownloadRepository:
             values["download_path"] = download_path
         if payload_resume is not None:
             values["payload_resume"] = payload_resume
+        if payload_force_start is not None:
+            values["payload_force_start"] = payload_force_start
         if payload_pending is not None:
             values["payload_pending"] = payload_pending
         if clear_payload_rejection:

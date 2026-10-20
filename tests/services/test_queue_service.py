@@ -4035,7 +4035,7 @@ async def _hold_only_row(sm: SessionMaker, *, resume: bool) -> None:
         await session.commit()
 
 
-@pytest.mark.parametrize("raw_state", ["checkingResumeData", "moving"])
+@pytest.mark.parametrize("raw_state", ["checkingResumeData", "moving", "allocating", "unknown"])
 async def test_held_payload_waits_out_transient_client_work(
     sessionmaker_: SessionMaker, raw_state: str
 ) -> None:
@@ -4061,6 +4061,72 @@ async def test_held_payload_waits_out_transient_client_work(
     async with sessionmaker_() as session:
         row = (await session.execute(select(Download))).scalar_one()
         assert row.payload_pending and not row.payload_resume
+
+
+class _StoppingQbt(FakeQbittorrent):
+    """Stops on pause and records each start, as qBittorrent reports them."""
+
+    resumed = 0
+
+    async def pause(self, info_hash: str) -> None:
+        self.statuses = [
+            s.model_copy(update={"raw_state": "stoppedDL", "force_start": False})
+            for s in self.statuses
+        ]
+
+    async def resume(self, info_hash: str) -> None:
+        self.resumed += 1
+
+
+@pytest.mark.parametrize("raw_state", ["allocating", "unknown"])
+async def test_ambiguous_held_payload_resumes_once_it_settles_running(
+    sessionmaker_: SessionMaker, raw_state: str
+) -> None:
+    from plex_manager.ports.download_client import DownloadedFile
+
+    await _seed_request_with_download(sessionmaker_, first_seen_at=datetime.now(UTC))
+    await _hold_only_row(sessionmaker_, resume=False)
+    qbt = _StoppingQbt(
+        statuses=[DownloadStatus(info_hash=_HASH, name=_TITLE, raw_state=raw_state)],
+        files={_HASH: [DownloadedFile(name="movie.mkv", size_bytes=100, index=0, priority=1)]},
+    )
+    async with sessionmaker_() as session:
+        await queue_service.reconcile_and_list(qbt, session)
+    async with sessionmaker_() as session:
+        row = (await session.execute(select(Download))).scalar_one()
+        assert row.payload_pending
+        assert (row.failed_reason or "").startswith("payload validation pending")
+
+    qbt.statuses = [DownloadStatus(info_hash=_HASH, name=_TITLE, raw_state="downloading")]
+    async with sessionmaker_() as session:
+        await queue_service.reconcile_and_list(qbt, session)
+    assert qbt.resumed == 1
+    async with sessionmaker_() as session:
+        row = (await session.execute(select(Download))).scalar_one()
+        assert not row.payload_pending and row.status == "downloading"
+
+
+@pytest.mark.parametrize("raw_state", ["forcedDL", "checkingDL"])
+async def test_validation_restores_force_start(sessionmaker_: SessionMaker, raw_state: str) -> None:
+    from plex_manager.ports.download_client import DownloadedFile
+
+    # qBittorrent reports the flag separately; a forced torrent may be checkingDL.
+    await _seed_request_with_download(sessionmaker_, first_seen_at=datetime.now(UTC))
+    await _hold_only_row(sessionmaker_, resume=False)
+    qbt = _StoppingQbt(
+        statuses=[
+            DownloadStatus(info_hash=_HASH, name=_TITLE, raw_state=raw_state, force_start=True)
+        ],
+        files={_HASH: [DownloadedFile(name="movie.mkv", size_bytes=100, index=0, priority=1)]},
+    )
+    async with sessionmaker_() as session:
+        await queue_service.reconcile_and_list(qbt, session)
+    assert qbt.force_started == [_HASH]
+    assert qbt.resumed == 0
+    async with sessionmaker_() as session:
+        row = (await session.execute(select(Download))).scalar_one()
+        assert not row.payload_pending
+        assert row.payload_resume and row.payload_force_start
 
 
 @pytest.mark.parametrize("raw_state", ["stoppedDL", "stoppedMetaDL"])

@@ -15,6 +15,7 @@ import os
 import socket
 import ssl
 from typing import Any
+from urllib.parse import parse_qsl
 
 import httpcore
 import httpx
@@ -2075,6 +2076,39 @@ async def test_pause_resume_use_legacy_endpoints_on_qbit4() -> None:
     assert "/api/v2/torrents/resume" in seen
     assert "/api/v2/torrents/stop" not in seen
     assert "/api/v2/torrents/start" not in seen
+
+
+async def test_force_start_flag_is_read_from_info_not_inferred_from_state() -> None:
+    # A forced torrent can report a non-forced* state such as checkingDL.
+    row = {**INFO_ROWS[0], "state": "checkingDL", "force_start": True}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/api/v2/auth/login":
+            return _login_response()
+        return httpx.Response(200, json=[row])
+
+    status = await _client(handler).get_status(MAGNET_HASH)
+    assert status is not None and status.force_start
+    plain = await _client().get_status(MAGNET_HASH)
+    assert plain is not None and not plain.force_start
+
+
+async def test_force_start_sets_force_start_without_a_separate_start() -> None:
+    # setForceStart with value=true starts a stopped torrent in forced mode itself.
+    requests: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/api/v2/auth/login":
+            return _login_response()
+        requests.append(request)
+        return httpx.Response(200, text="")
+
+    await _client(handler).force_start(MAGNET_HASH.upper())
+    assert [r.url.path for r in requests] == ["/api/v2/torrents/setForceStart"]
+    assert dict(parse_qsl(requests[0].content.decode())) == {
+        "hashes": MAGNET_HASH,
+        "value": "true",
+    }
 
 
 async def test_add_base32_btih_magnet_normalizes_to_hex() -> None:

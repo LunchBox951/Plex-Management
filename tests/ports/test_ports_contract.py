@@ -177,6 +177,9 @@ class _FakeDownloadClient:
     async def resume(self, info_hash: str) -> None:
         return None
 
+    async def force_start(self, info_hash: str) -> None:
+        return None
+
     async def remove(self, info_hash: str, *, delete_files: bool) -> None:
         return None
 

@@ -896,6 +896,9 @@ class Download(Base):
     retry_count: Mapped[int] = mapped_column(default=0, server_default=sa.text("0"))
     payload_pending: Mapped[bool] = mapped_column(default=False, server_default=sa.false())
     payload_resume: Mapped[bool] = mapped_column(default=False, server_default=sa.false())
+    # Captured and cleared with ``payload_resume``: the held torrent was force-started,
+    # so validation restores force-start rather than a queue-limited start.
+    payload_force_start: Mapped[bool] = mapped_column(default=False, server_default=sa.false())
     payload_rejection: Mapped[str | None] = mapped_column(String)
     torrent_attempt: Mapped[int] = mapped_column(default=1, server_default=sa.text("1"))
     scored_releases_json: Mapped[list[dict[str, Any]] | None] = mapped_column(sa.JSON)
