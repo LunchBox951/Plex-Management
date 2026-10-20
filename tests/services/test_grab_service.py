@@ -5352,3 +5352,131 @@ async def test_grab_persists_validation_hold_before_reconcile(
         ).scalar_one()
         assert row.payload_pending
         assert row.payload_resume is created
+
+
+class _HeldOrphanClient(FakeQbittorrent):
+    """A 409 add that resolves to a torrent the client already holds."""
+
+    resumed = 0
+
+    async def add(self, magnet_or_url: str, save_path: str, category: str) -> AddResult:
+        result = await super().add(magnet_or_url, save_path, category)
+        return result.model_copy(update={"payload_pending": True, "created": False})
+
+    async def pause(self, info_hash: str) -> None:
+        self.statuses = [s.model_copy(update={"raw_state": "stoppedDL"}) for s in self.statuses]
+
+    async def resume(self, info_hash: str) -> None:
+        self.resumed += 1
+
+
+async def _grab_existing_torrent(
+    sm: SessionMaker, qbt: FakeQbittorrent, *, terminal_row: bool = False
+) -> Download:
+    async with sm() as session:
+        request = MediaRequest(
+            tmdb_id=300, media_type=MediaType.movie, title="C", status=RequestStatus.searching
+        )
+        session.add(request)
+        await session.flush()
+        if terminal_row:
+            session.add(Download(torrent_hash=_HASH, status="failed", media_request_id=request.id))
+        await session.commit()
+        await grab_service.grab(
+            qbt, session, scored=_scored(_HASH), request_id=request.id, tmdb_id=300
+        )
+    async with sm() as session:
+        return (await session.execute(select(Download))).scalar_one()
+
+
+@pytest.mark.parametrize(
+    ("raw_state", "progress", "has_files", "owned"),
+    [
+        # The crashed grab's own held add: stopped at metadata, or still fetching it.
+        ("stoppedDL", 0.0, True, True),
+        ("pausedDL", 0.0, True, True),
+        ("metaDL", 0.0, False, True),
+        ("forcedMetaDL", 0.0, False, True),
+        # Anything else keeps its live state.
+        ("stoppedDL", 0.4, True, False),
+        ("stoppedDL", 0.0, False, False),
+        ("stoppedUP", 1.0, True, False),
+        ("downloading", 0.0, True, False),
+    ],
+)
+async def test_untracked_held_orphan_is_owned_by_the_regrab(
+    sessionmaker_: SessionMaker, raw_state: str, progress: float, has_files: bool, owned: bool
+) -> None:
+    from plex_manager.ports.download_client import DownloadedFile
+
+    files = [DownloadedFile(name="movie.mkv", size_bytes=100, index=0, priority=1)]
+    qbt = _HeldOrphanClient(
+        statuses=[
+            DownloadStatus(info_hash=_HASH, name="C", raw_state=raw_state, progress=progress)
+        ],
+        files={_HASH: files} if has_files else {},
+    )
+    row = await _grab_existing_torrent(sessionmaker_, qbt)
+    assert row.payload_pending
+    assert row.payload_resume is owned
+
+
+@pytest.mark.parametrize(("progress", "started"), [(0.0, True), (0.4, False)])
+async def test_regrabbed_held_orphan_starts_after_validation(
+    sessionmaker_: SessionMaker, progress: float, started: bool
+) -> None:
+    from plex_manager.ports.download_client import DownloadedFile
+
+    # A partially downloaded torrent the operator stopped stays stopped.
+    qbt = _HeldOrphanClient(
+        statuses=[
+            DownloadStatus(info_hash=_HASH, name="C", raw_state="stoppedDL", progress=progress)
+        ],
+        files={_HASH: [DownloadedFile(name="movie.mkv", size_bytes=100, index=0, priority=1)]},
+    )
+    await _grab_existing_torrent(sessionmaker_, qbt)
+    async with sessionmaker_() as session:
+        await queue_service.reconcile_and_list(qbt, session)
+    assert qbt.resumed == (1 if started else 0)
+    async with sessionmaker_() as session:
+        row = (await session.execute(select(Download))).scalar_one()
+        assert not row.payload_pending and row.status == "downloading"
+
+
+async def test_regrabbed_metadata_orphan_stays_under_its_hold(sessionmaker_: SessionMaker) -> None:
+    # It already has the stop-at-metadata hold, so it is not removed and regrabbed.
+    qbt = _HeldOrphanClient(
+        statuses=[DownloadStatus(info_hash=_HASH, name="C", raw_state="metaDL")]
+    )
+    await _grab_existing_torrent(sessionmaker_, qbt)
+    async with sessionmaker_() as session:
+        await queue_service.reconcile_and_list(qbt, session)
+    assert not qbt.removed
+    async with sessionmaker_() as session:
+        row = (await session.execute(select(Download))).scalar_one()
+        assert row.payload_pending and row.status != "failed"
+        assert "waiting for complete metadata" in (row.failed_reason or "")
+
+
+@pytest.mark.parametrize("terminal_row", [False, True])
+async def test_regrabbed_force_started_orphan_keeps_force_start(
+    sessionmaker_: SessionMaker, terminal_row: bool
+) -> None:
+    from plex_manager.ports.download_client import DownloadedFile
+
+    # The hold stops the torrent once metadata arrives, which clears the client's
+    # flag, so the grab must record it while the torrent still reports it.
+    qbt = _HeldOrphanClient(
+        statuses=[
+            DownloadStatus(info_hash=_HASH, name="C", raw_state="forcedMetaDL", force_start=True)
+        ]
+    )
+    row = await _grab_existing_torrent(sessionmaker_, qbt, terminal_row=terminal_row)
+    assert row.payload_resume and row.payload_force_start
+
+    qbt.statuses = [DownloadStatus(info_hash=_HASH, name="C", raw_state="stoppedDL")]
+    qbt.files = {_HASH: [DownloadedFile(name="movie.mkv", size_bytes=100, index=0, priority=1)]}
+    async with sessionmaker_() as session:
+        await queue_service.reconcile_and_list(qbt, session)
+    assert qbt.force_started == [_HASH]
+    assert qbt.resumed == 0

@@ -36,7 +36,8 @@ once accepted — to change a decision, add a new ADR that supersedes the old on
 | [0027](0027-wolfi-container-base.md) | Digest-pinned Wolfi/glibc container base with exact APK packages | Accepted |
 | [0029](0029-durable-pre-add-intent.md) | Durable pre-add intent for the grab window (qualifies ADR-0006's port contract; `0028` is earmarked by the #484 auth series) | Proposed |
 | [0030](0030-pre-add-intent-review-and-rollout.md) | Pre-add intent review constraints and compatible rollout (proposes to supersede parts of ADR-0029) | Proposed |
-| [0031](0031-pre-download-payload-validation.md) | Validate torrent filenames and select videos before payload download | Accepted |
+| [0031](0031-pre-download-payload-validation.md) | Validate torrent filenames and select videos before payload download | Accepted (superseded in part by 0032) |
+| [0032](0032-held-orphan-ownership-at-grab.md) | Take ownership of a held orphan when a grab reuses it (supersedes one sentence of ADR-0031) | Accepted |
 
 ADRs 0001–0007 were accepted on **2026-06-29** during the v2 brainstorming
 session; 0008 during the first backend-alpha session; 0009 during the
