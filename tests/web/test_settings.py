@@ -1304,6 +1304,8 @@ async def test_same_server_url_change_keeps_every_session_and_records_one_audit_
     assert await _stored_machine_id(sessionmaker_) == "SAME-MID-1234"
     assert await _active_session_count(sessionmaker_) == 2
     assert not admin_stream.closed
+    # Other admin tabs refresh the audit list rather than waiting for its poll.
+    assert "audit:sign-outs" in (await admin_stream.get()).topics
     admin_stream.close()
     assert deps.plex_identity_generation.value == generation_before
     assert not app.state.watchlist_wake_event.is_set()

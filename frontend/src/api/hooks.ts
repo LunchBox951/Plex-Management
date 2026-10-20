@@ -247,6 +247,9 @@ export function useUpdateSettings() {
         // picker result before the form re-enables it, so old folders cannot remain
         // selectable while the new connection refetch is in flight.
         qc.removeQueries({ queryKey: queryKeys.plexLibraries })
+        // A same-server Plex save writes a relocation row to the automatic
+        // sign-outs list (issue #633); show it now rather than on the next poll.
+        void qc.invalidateQueries({ queryKey: queryKeys.automaticSignOutsAll })
       } else {
         // Clear any prior unconfigured/auth error, which retry:false otherwise leaves
         // stuck until the page remounts.

@@ -2263,6 +2263,10 @@ async def put_settings_endpoint(
                     topics = ["settings", "ops:health"]
                     if written_fields.intersection(_UPDATE_POLICY_FIELDS):
                         topics.append("updates")
+                    if server_relocated:
+                        # The relocation's audit row is listed under Settings ->
+                        # Automatic sign-outs, which no settings topic refreshes.
+                        topics.append("audit:sign-outs")
                     publish_realtime(
                         request.app,
                         tuple(topics),

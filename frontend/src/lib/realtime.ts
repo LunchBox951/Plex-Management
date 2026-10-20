@@ -135,6 +135,7 @@ export function applyRealtimeEvent(qc: QueryClient, event: RealtimeEventPayload)
     void qc.invalidateQueries({ queryKey: queryKeys.opsDisk })
     void qc.invalidateQueries({ queryKey: queryKeys.opsHealth })
     void qc.invalidateQueries({ queryKey: queryKeys.updateStatus })
+    void qc.invalidateQueries({ queryKey: queryKeys.automaticSignOutsAll })
   }
   if (topics.has('requests')) {
     void qc.invalidateQueries({ queryKey: queryKeys.requests })
@@ -152,6 +153,9 @@ export function applyRealtimeEvent(qc: QueryClient, event: RealtimeEventPayload)
     // Match the local settings mutation: TMDB credentials back every Discover
     // cache, and Discover has no polling cadence to heal another tab on its own.
     void qc.invalidateQueries({ queryKey: ['discover'] })
+  }
+  if (topics.has('audit:sign-outs')) {
+    void qc.invalidateQueries({ queryKey: queryKeys.automaticSignOutsAll })
   }
   if (topics.has('access')) {
     void qc.invalidateQueries({ queryKey: queryKeys.appKeyStatus })
