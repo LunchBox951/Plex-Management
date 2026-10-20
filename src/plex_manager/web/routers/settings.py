@@ -32,7 +32,7 @@ from sqlalchemy import update
 from sqlalchemy.ext.asyncio import AsyncSession
 from starlette.status import HTTP_409_CONFLICT
 
-from plex_manager.adapters.plex.oauth import PlexTvClient, find_owned_server
+from plex_manager.adapters.plex.oauth import PlexTvClient, PlexVerifyError, find_owned_server
 from plex_manager.adapters.service_url import same_service_base
 from plex_manager.config import get_settings
 from plex_manager.db import get_session
@@ -1557,9 +1557,10 @@ async def revoke_app_key_endpoint(
 class _VerifiedPlexServer:
     """A Plex server that passed the full verification ladder.
 
-    ``name`` is the display name plex.tv reported for the owned resource. Only a
-    Plex-session caller's ownership check fetches resources, so an API-key
-    caller's verification leaves it ``None`` rather than paying an extra probe.
+    ``name`` is the display name used only for audit records: plex.tv's owned
+    resource name for a Plex-session caller, else the server's own
+    ``friendlyName`` (see :func:`_label_relocated_server`). ``None`` when no
+    name could be read.
     """
 
     machine_identifier: str
@@ -1665,9 +1666,49 @@ async def _verify_plex_repoint(
                 "Re-enter the Plex token so a stored credential is never sent to a new destination."
             ),
         )
-    return True, await _run_plex_identity_ladder(
+    verified = await _run_plex_identity_ladder(
         session, store, client, context, url=effective_url, token=effective_token
     )
+    if verified.name is None and verified.machine_identifier == await store.get(
+        PLEX_MACHINE_ID_SETTING
+    ):
+        verified = await _label_relocated_server(
+            store, client, verified, effective_url, effective_token
+        )
+    return True, verified
+
+
+async def _label_relocated_server(
+    store: SettingsStore,
+    client: httpx.AsyncClient,
+    verified: _VerifiedPlexServer,
+    url: str,
+    token: str,
+) -> _VerifiedPlexServer:
+    """Add the display name a likely relocation's audit row needs (#633).
+
+    Only a Plex-session caller's ownership check reads plex.tv resources, which
+    carry the name, so an API-key relocation asks the just-verified server
+    itself. This runs before any write, because no live probe may run inside
+    the committing transaction, and only when the derived id already matches
+    the anchor. ``write_settings`` still makes the authoritative comparison.
+    Best-effort: the ladder already passed, so a failure to read a label is
+    logged and the row falls back to the identity fingerprint alone.
+    """
+    plex_tv = PlexTvClient(
+        client,
+        client_identifier=await store.get(_CLIENT_ID_SETTING) or _FALLBACK_CLIENT_IDENTIFIER,
+    )
+    try:
+        name = await plex_tv.fetch_server_name(url, token)
+    except PlexVerifyError as exc:
+        _logger.warning(
+            "could not read the Plex server's display name for its relocation audit "
+            "record (%s); the record names it by identity fingerprint only",
+            exc.code,
+        )
+        return verified
+    return _VerifiedPlexServer(verified.machine_identifier, name)
 
 
 async def _run_plex_identity_ladder(

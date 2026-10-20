@@ -428,6 +428,7 @@ def _repoint_transport(
     authorized: bool = True,
     resources: list[dict[str, object]] | None = None,
     probes: list[httpx.Request] | None = None,
+    friendly_name: str | None = "Plex Box",
 ) -> httpx.MockTransport:
     """Serve the repoint verification ladder: /identity, /library/sections, plex.tv.
 
@@ -435,6 +436,8 @@ def _repoint_transport(
     answer 401 (a reachable server that rejects the token). ``resources=None``
     makes any plex.tv ownership lookup FAIL the test loudly — the api-key path
     must never consult it; session-caller tests pass a resource list instead.
+    ``friendly_name=None`` makes the authenticated root (``GET /``, read only to
+    label an API-key relocation's audit row) answer 500.
     """
 
     def handler(request: httpx.Request) -> httpx.Response:
@@ -450,6 +453,10 @@ def _repoint_transport(
             if not authorized:
                 return httpx.Response(401)
             return httpx.Response(200, json={"MediaContainer": {"Directory": []}})
+        if request.url.path == "/":
+            if friendly_name is None:
+                return httpx.Response(500)
+            return httpx.Response(200, json={"MediaContainer": {"friendlyName": friendly_name}})
         raise AssertionError(f"unexpected request: {request.method} {request.url}")
 
     return httpx.MockTransport(handler)
@@ -1330,8 +1337,8 @@ async def test_same_server_token_rotation_is_a_relocation(
 ) -> None:
     """Rotating the Plex token for the anchored server is a relocation too: the
     new token is verified, sessions survive, and the audit row names only which
-    setting changed. An API-key caller fetches no plex.tv resources, so the row
-    carries the fingerprint without a display name rather than paying a probe."""
+    setting changed. An API-key caller has no plex.tv resources to read a name
+    from, so the row takes the verified server's own ``friendlyName``."""
     await seed(initialized=True, app_api_key=_API_KEY)
     await _seed_plex_identity(
         sessionmaker_, plex_url="http://old:32400", machine_id="SAME-MID-1234"
@@ -1350,7 +1357,7 @@ async def test_same_server_token_rotation_is_a_relocation(
 
     assert put.status_code == 200
     assert all(p.headers.get("X-Plex-Token") == "rotated-token" for p in probes)
-    assert len(probes) == 2
+    assert [p.url.path for p in probes] == ["/identity", "/library/sections", "/"]
     async with sessionmaker_() as session:
         assert await SettingsStore(session).get("plex_token") == "rotated-token"
     assert await _active_session_count(sessionmaker_) == 1
@@ -1360,12 +1367,40 @@ async def test_same_server_token_rotation_is_a_relocation(
     assert len(rows) == 1
     assert rows[0].user_id is None  # an API-key save has no acting user
     assert rows[0].new_value == {
-        "server_name": None,
+        "server_name": "Plex Box",
         "server_fingerprint": "SAME-MID",
         "changed_fields": ["plex_token"],
         "sessions_revoked": 0,
     }
     assert "rotated-token" not in json.dumps([rows[0].new_value, rows[0].description])
+
+
+async def test_relocation_survives_an_unreadable_server_name(
+    client: httpx.AsyncClient, app: FastAPI, seed: SeedFn, sessionmaker_: SessionMaker
+) -> None:
+    """The name only labels the audit row. Once the ladder has passed, failing
+    to read it must not fail the save: the row falls back to the fingerprint."""
+    await seed(initialized=True, app_api_key=_API_KEY)
+    await _seed_plex_identity(
+        sessionmaker_, plex_url="http://old:32400", machine_id="SAME-MID-1234"
+    )
+    await _admin_session_cookies(app, plex_id=9306, tag="unnamed-reloc")
+    await _use_transport(app, _repoint_transport(identity="SAME-MID-1234", friendly_name=None))
+
+    put = await client.put(
+        "/api/v1/settings",
+        json={"plex_token": "rotated-token"},
+        headers={"X-Api-Key": _API_KEY},
+    )
+
+    assert put.status_code == 200
+    assert await _active_session_count(sessionmaker_) == 1
+    rows = await _audit_rows(sessionmaker_)
+    assert len(rows) == 1
+    assert rows[0].new_value is not None
+    assert rows[0].new_value["server_name"] is None
+    assert rows[0].description is not None
+    assert rows[0].description.startswith("Plex server SAME-MID saved with a new token.")
 
 
 async def test_same_url_token_change_to_a_different_server_still_revokes(
