@@ -638,6 +638,7 @@ class SqlDownloadRepository:
         timeout_at: datetime | None = None,
         payload_pending: bool = False,
         payload_resume: bool = False,
+        payload_force_start: bool = False,
     ) -> DownloadRecord:
         row = Download(
             torrent_hash=torrent_hash,
@@ -653,6 +654,7 @@ class SqlDownloadRepository:
             timeout_at=timeout_at,
             payload_pending=payload_pending,
             payload_resume=payload_resume,
+            payload_force_start=payload_force_start,
         )
         self._session.add(row)
         await self._session.flush()

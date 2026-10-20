@@ -269,14 +269,18 @@ class TorrentRemovalInFlightError(Exception):
         super().__init__(f"torrent {torrent_hash} (download {download_id}) is being removed; retry")
 
 
-async def _is_untracked_held_orphan(qbt: DownloadClientPort, torrent_hash: str) -> bool:
+async def _held_orphan_intent(qbt: DownloadClientPort, torrent_hash: str) -> tuple[bool, bool]:
+    """Return ``(resume, force_start)`` intent for an untracked pre-existing torrent."""
     status = await qbt.get_status(torrent_hash)
     if status is None:
-        return False
+        return False, False
     has_manifest = status.raw_state not in HELD_METADATA_STATES and bool(
         await qbt.list_files(torrent_hash)
     )
-    return is_unstarted_held_torrent(status.raw_state, status.progress, has_manifest=has_manifest)
+    if not is_unstarted_held_torrent(status.raw_state, status.progress, has_manifest=has_manifest):
+        return False, False
+    # The hold's stop clears the client's force-start flag, so capture it now.
+    return True, status.force_start or status.raw_state == "forcedMetaDL"
 
 
 async def _reuse_terminal_row(
@@ -297,6 +301,7 @@ async def _reuse_terminal_row(
     actually_added: bool,
     payload_pending: bool = False,
     payload_resume: bool = False,
+    payload_force_start: bool = False,
 ) -> tuple[DownloadRecord, bool]:
     """Drive a terminal (Failed/Imported) row back to Downloading and re-own it.
 
@@ -405,7 +410,7 @@ async def _reuse_terminal_row(
         retry_count=0,
         payload_pending=payload_pending,
         payload_resume=payload_resume,
-        payload_force_start=False,
+        payload_force_start=payload_force_start,
         clear_payload_rejection=True,
     )
     if not claimed:
@@ -1341,6 +1346,7 @@ async def grab(
     # after validation. A pre-existing one is judged like a legacy row, by its live
     # client state, unless it is an untracked held orphan (see below).
     payload_resume = add_result.payload_pending and add_result.created
+    payload_force_start = False
     if not torrent_hash:
         # The client accepted it but no real info-hash could be derived (rare
         # opaque URL) and the indexer supplied none either. Tracking by the indexer
@@ -1414,7 +1420,7 @@ async def grab(
         # No active row tracks this hash, so a never-started held torrent is this
         # app's own add from a grab that crashed before its row committed (#481).
         # This grab exists to download it; record the intent validation then honours.
-        payload_resume = await _is_untracked_held_orphan(qbt, torrent_hash)
+        payload_resume, payload_force_start = await _held_orphan_intent(qbt, torrent_hash)
 
     if existing is not None:
         try:
@@ -1436,6 +1442,7 @@ async def grab(
                     actually_added=actually_added,
                     payload_pending=add_result.payload_pending,
                     payload_resume=payload_resume,
+                    payload_force_start=payload_force_start,
                 )
                 if claimed_reuse:
                     break
@@ -1520,6 +1527,7 @@ async def grab(
                 timeout_at=datetime.now(UTC) + METADATA_STALL_WINDOW,
                 payload_pending=add_result.payload_pending,
                 payload_resume=payload_resume,
+                payload_force_start=payload_force_start,
             )
         except IntegrityError:
             # A concurrent grab won the race. It either grabbed the SAME release

@@ -18,7 +18,7 @@ When an add returns `created=False`, the grab reads the client's live state for 
 - no non-terminal download row tracks the hash;
 - the torrent is `stoppedDL` or `pausedDL` with zero progress and a readable file manifest, or it is still fetching metadata (`metaDL` or `forcedMetaDL`).
 
-That shape is the app's own held add from the crashed grab, and the current grab exists to download it. A metadata-fetching orphan therefore proceeds under its existing hold instead of taking ADR-0031's legacy remove-and-regrab path. Any other pre-existing torrent keeps ADR-0031's rule: its live state decides whether it was running. That includes a partially downloaded, completed, seeding, or still-tracked torrent.
+That shape is the app's own held add from the crashed grab, and the current grab exists to download it. If the orphan reports force-start, the grab records that as well, because the hold's stop clears the client's flag; validation then restores force-start rather than a queue-limited start. A metadata-fetching orphan therefore proceeds under its existing hold instead of taking ADR-0031's legacy remove-and-regrab path. Any other pre-existing torrent keeps ADR-0031's rule: its live state decides whether it was running. That includes a partially downloaded, completed, seeding, or still-tracked torrent.
 
 `domain.payload_validation.is_unstarted_held_torrent` is the single definition of a held torrent the app may take ownership of. The operator Adopt action planned in #481 must use the same definition, so automatic and manual ownership cannot drift.
 

@@ -5370,12 +5370,17 @@ class _HeldOrphanClient(FakeQbittorrent):
         self.resumed += 1
 
 
-async def _grab_existing_torrent(sm: SessionMaker, qbt: FakeQbittorrent) -> Download:
+async def _grab_existing_torrent(
+    sm: SessionMaker, qbt: FakeQbittorrent, *, terminal_row: bool = False
+) -> Download:
     async with sm() as session:
         request = MediaRequest(
             tmdb_id=300, media_type=MediaType.movie, title="C", status=RequestStatus.searching
         )
         session.add(request)
+        await session.flush()
+        if terminal_row:
+            session.add(Download(torrent_hash=_HASH, status="failed", media_request_id=request.id))
         await session.commit()
         await grab_service.grab(
             qbt, session, scored=_scored(_HASH), request_id=request.id, tmdb_id=300
@@ -5451,3 +5456,27 @@ async def test_regrabbed_metadata_orphan_stays_under_its_hold(sessionmaker_: Ses
         row = (await session.execute(select(Download))).scalar_one()
         assert row.payload_pending and row.status != "failed"
         assert "waiting for complete metadata" in (row.failed_reason or "")
+
+
+@pytest.mark.parametrize("terminal_row", [False, True])
+async def test_regrabbed_force_started_orphan_keeps_force_start(
+    sessionmaker_: SessionMaker, terminal_row: bool
+) -> None:
+    from plex_manager.ports.download_client import DownloadedFile
+
+    # The hold stops the torrent once metadata arrives, which clears the client's
+    # flag, so the grab must record it while the torrent still reports it.
+    qbt = _HeldOrphanClient(
+        statuses=[
+            DownloadStatus(info_hash=_HASH, name="C", raw_state="forcedMetaDL", force_start=True)
+        ]
+    )
+    row = await _grab_existing_torrent(sessionmaker_, qbt, terminal_row=terminal_row)
+    assert row.payload_resume and row.payload_force_start
+
+    qbt.statuses = [DownloadStatus(info_hash=_HASH, name="C", raw_state="stoppedDL")]
+    qbt.files = {_HASH: [DownloadedFile(name="movie.mkv", size_bytes=100, index=0, priority=1)]}
+    async with sessionmaker_() as session:
+        await queue_service.reconcile_and_list(qbt, session)
+    assert qbt.force_started == [_HASH]
+    assert qbt.resumed == 0
