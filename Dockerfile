@@ -14,7 +14,7 @@ COPY frontend/ ./
 RUN npm run build
 
 # ---- builder: install the app into an isolated venv ----
-FROM cgr.dev/chainguard/wolfi-base:latest@sha256:c2a4815b6ca49b9bbafd451b4bde690d567a86b2b6b54877faac8082a7bc4296 AS builder
+FROM cgr.dev/chainguard/wolfi-base:latest@sha256:d68b2b10db0ddb2c6d9cb3a7720ecab5ca19b4b430fd592cd07c23d7da971b56 AS builder
 ENV PIP_NO_CACHE_DIR=1 PIP_DISABLE_PIP_VERSION_CHECK=1
 WORKDIR /app
 
@@ -39,7 +39,7 @@ COPY --from=web /src/plex_manager/web/static ./src/plex_manager/web/static
 RUN pip install -c requirements/runtime-constraints.txt ".[postgres]"
 
 # ---- runtime: Wolfi/glibc image with just the venv + migration assets ----
-FROM cgr.dev/chainguard/wolfi-base:latest@sha256:c2a4815b6ca49b9bbafd451b4bde690d567a86b2b6b54877faac8082a7bc4296 AS runtime
+FROM cgr.dev/chainguard/wolfi-base:latest@sha256:d68b2b10db0ddb2c6d9cb3a7720ecab5ca19b4b430fd592cd07c23d7da971b56 AS runtime
 ARG PLEX_MANAGER_BUILD_ID=0.0.0
 # The app's config default is loopback (safe for bare-metal first runs); inside
 # the container the ONLY way in is the published port, so bind all interfaces
@@ -67,7 +67,7 @@ WORKDIR /app
 # they can enter a Plex library. The versioned ffmpeg package supplies ffprobe.
 RUN apk add --no-cache \
         python-3.14=3.14.7-r4 \
-        ffmpeg-8.1=8.1.2-r2 \
+        ffmpeg-9.0=9.0.2-r3 \
         tzdata=2026c-r0 \
     && mkdir -p /app/data \
     && chown 10001:10001 /app/data

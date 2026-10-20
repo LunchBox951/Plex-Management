@@ -20,7 +20,7 @@ WOLFI_BASE_FROM = re.compile(
 PYTHON_PACKAGE = "python-3.14=3.14.7-r4"
 PIP_PACKAGE = "py3.14-pip=26.1.2-r1"
 PIP_VERSION = "26.1.2"
-FFMPEG_PACKAGE = "ffmpeg-8.1=8.1.2-r2"
+FFMPEG_PACKAGE = "ffmpeg-9.0=9.0.2-r3"
 TZDATA_PACKAGE = "tzdata=2026c-r0"
 PUBLISH_SMOKES = (
     "Runtime contract smoke",
