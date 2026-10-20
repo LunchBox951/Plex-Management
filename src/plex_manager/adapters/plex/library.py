@@ -837,7 +837,9 @@ class PlexLibrary:
         except httpx.RequestError as exc:
             raise PlexLibraryError(f"plex request to {path} failed") from exc
 
-    async def list_sections(self, *, use_cache: bool = True) -> list[LibrarySection]:
+    async def list_sections(
+        self, *, use_cache: bool = True, write_cache: bool = True
+    ) -> list[LibrarySection]:
         """Return the configured library sections (movie / show), cached briefly.
 
         ``use_cache=False`` skips the cache READ and re-pages Plex live -- the
@@ -848,6 +850,10 @@ class PlexLibrary:
         just bypasses it), so the availability fast paths (``is_available``,
         ``present_seasons``, ...) stay warm for the request-serving path that
         follows a health check.
+
+        ``write_cache=False`` neither sets nor invalidates the cache: the caller
+        has not yet verified which server answered, so the response must not
+        reach any later caller.
         """
         if use_cache:
             cached = _SECTIONS_CACHE.get(self._cache_key)
@@ -855,6 +861,8 @@ class PlexLibrary:
                 return list(cached)
         payload = await self._get("/library/sections")
         sections = _parse_sections_envelope(payload)
+        if not write_cache:
+            return sections
         # Cache only a list that CONTAINS a movie section. A no-movie result is a
         # self-healing negative: validate_plex reports ok=False and tells the operator
         # to add a Movie library and test again, so caching the empty/show-only
