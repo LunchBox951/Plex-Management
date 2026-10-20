@@ -1637,6 +1637,30 @@ describe('Settings — Automatic sign-outs (issue #556)', () => {
     expect(signOutsSection().getByText(/0 sessions revoked/)).toBeInTheDocument()
   })
 
+  it('shows a same-server Plex relocation as a save that signed no one out', () => {
+    h.signOuts = [
+      signOut({
+        id: 6,
+        action_type: 'plex.server_relocated',
+        user_id: null,
+        username: null,
+        previous_share_state: null,
+        share_state: null,
+        sessions_revoked: 0,
+        signed_out: false,
+        description: 'Plex server "Home" (abcd1234) saved with a new address. No one was signed out.',
+      }),
+    ]
+    render(<Settings />, { wrapper: Wrapper })
+    const section = signOutsSection()
+    expect(section.getByText('Plex server')).toBeInTheDocument()
+    expect(section.getByText('Plex server moved')).toBeInTheDocument()
+    expect(section.getByText(/same server, so no one was signed out/)).toBeInTheDocument()
+    expect(section.getByText(/"Home" \(abcd1234\) saved with a new address/)).toBeInTheDocument()
+    expect(section.queryByText(/Unknown account/)).not.toBeInTheDocument()
+    expect(section.queryByText(/sessions revoked/)).not.toBeInTheDocument()
+  })
+
   it('surfaces a failed fetch with a retry instead of an empty list', () => {
     h.signOutsIsError = true
     h.signOutsError = { message: 'nope', status: 500 } as ApiError

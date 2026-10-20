@@ -224,7 +224,8 @@ export interface paths {
          *     Deliberately narrow — NOT a generic audit-log browser. Only the
          *     automatic-sign-out action family
          *     (:data:`~plex_manager.services.audit_service.AUTOMATIC_SIGN_OUT_ACTION_TYPES`)
-         *     is selected, so other audit rows (request handoffs, coordinator resets, and
+         *     and same-server Plex relocations (issue #633, which keep everyone signed in)
+         *     are selected, so other audit rows (request handoffs, coordinator resets, and
          *     anything added later) do not become a web resource nobody reviewed.
          *
          *     Admin-only for the same reason the sessions list is: the rows name other
@@ -1242,6 +1243,17 @@ export interface paths {
          *     auditable-revoke convention) rather than deleting; API-key auth is
          *     untouched, so the ``X-Api-Key`` recovery path still works throughout.
          *
+         *     A RELOCATION (#633) is the exception: the ladder verified the SAME
+         *     ``machineIdentifier`` that is already anchored, so the change is a new
+         *     address or a rotated token for the server every session was already
+         *     authorized against. It runs the identical verification (including token
+         *     re-entry for a new destination) but commits in place: no session
+         *     revocation, no identity-generation bump, no watchlist snapshot-cleanup
+         *     wake, no Plex-session stream close, and one secret-free ``AuditLog`` row
+         *     (:func:`_record_plex_relocation`). The comparison reads the anchor in the
+         *     transaction that commits, and a missing anchor never counts as a match, so
+         *     a different or unknown identity keeps the revoking path above.
+         *
          *     An UNVERIFIABLE identity change — the effective pair is incomplete (a
          *     half-configured install, or an explicit ``""`` clear) — cannot be probed:
          *     the write proceeds, the STALE cached id is dropped (nothing may keep
@@ -1965,8 +1977,8 @@ export interface components {
          *     (issue #556). Every field here comes from the ``AuditLog`` row the sweep
          *     wrote in the same transaction as the revocation.
          *
-         *     ``action_type`` keeps the two causes apart, because they mean different
-         *     things to the person affected:
+         *     ``action_type`` keeps the causes apart, because they mean different things
+         *     to the person affected:
          *
          *     * ``user.share_revoked`` — plex.tv confirmed the account no longer reaches
          *       this server. Access really is gone.
@@ -1974,7 +1986,12 @@ export interface components {
          *       the share could not be checked at all. Access was NOT removed; signing in
          *       with Plex again restores it.
          *
-         *     Either action type may carry the ``_admin_exempt`` suffix, which records a
+         *     * ``plex.server_relocated`` — a Plex URL or token save that verified the
+         *       SAME server identity (#633). Nobody was signed out: ``user_id`` and
+         *       ``username`` are null, ``sessions_revoked`` is 0, and ``description``
+         *       names the server and which settings changed.
+         *
+         *     Either sign-out action type may carry the ``_admin_exempt`` suffix, which records a
          *     verdict deliberately NOT acted on for an owner/admin (ADR-0005's
          *     never-locked-out rule). Those rows report ``signed_out: false`` — they are
          *     the operator's cue to revoke by hand if the removal is genuine.

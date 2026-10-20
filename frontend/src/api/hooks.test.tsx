@@ -86,6 +86,7 @@ describe('useUpdateSettings', () => {
     qc.setQueryData(queryKeys.settings, { plex_url: 'http://old-plex:32400' })
     qc.setQueryData(queryKeys.plexLibraries, oldLibraries)
     const remove = vi.spyOn(qc, 'removeQueries')
+    const invalidate = vi.spyOn(qc, 'invalidateQueries')
 
     const { result } = renderHook(() => useUpdateSettings(), {
       wrapper: createWrapper(qc),
@@ -94,6 +95,8 @@ describe('useUpdateSettings', () => {
 
     await waitFor(() => expect(remove).toHaveBeenCalledWith({ queryKey: queryKeys.plexLibraries }))
     expect(qc.getQueryData(queryKeys.plexLibraries)).toBeUndefined()
+    // A same-server save records a relocation row in the sign-outs list (#633).
+    expect(invalidate).toHaveBeenCalledWith({ queryKey: queryKeys.automaticSignOutsAll })
     expect(qc.getQueryData(queryKeys.settings)).toEqual(saved)
   })
 

@@ -21,7 +21,7 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from plex_manager.config import get_settings
 from plex_manager.domain.eviction import EvictionCandidate, select_evictions
-from plex_manager.models import AuthSession, LogEvent, Setting, User
+from plex_manager.models import AuditLog, AuthSession, LogEvent, Setting, User
 from plex_manager.repositories.log_events import SqlLogEventRepository
 from plex_manager.services import log_capture_service, path_visibility
 from plex_manager.web import deps
@@ -428,6 +428,7 @@ def _repoint_transport(
     authorized: bool = True,
     resources: list[dict[str, object]] | None = None,
     probes: list[httpx.Request] | None = None,
+    friendly_name: str | None = "Plex Box",
 ) -> httpx.MockTransport:
     """Serve the repoint verification ladder: /identity, /library/sections, plex.tv.
 
@@ -435,6 +436,8 @@ def _repoint_transport(
     answer 401 (a reachable server that rejects the token). ``resources=None``
     makes any plex.tv ownership lookup FAIL the test loudly — the api-key path
     must never consult it; session-caller tests pass a resource list instead.
+    ``friendly_name=None`` makes the authenticated root (``GET /``, read only to
+    label an API-key relocation's audit row) answer 500.
     """
 
     def handler(request: httpx.Request) -> httpx.Response:
@@ -450,6 +453,10 @@ def _repoint_transport(
             if not authorized:
                 return httpx.Response(401)
             return httpx.Response(200, json={"MediaContainer": {"Directory": []}})
+        if request.url.path == "/":
+            if friendly_name is None:
+                return httpx.Response(500)
+            return httpx.Response(200, json={"MediaContainer": {"friendlyName": friendly_name}})
         raise AssertionError(f"unexpected request: {request.method} {request.url}")
 
     return httpx.MockTransport(handler)
@@ -1238,6 +1245,217 @@ async def test_non_repoint_edit_does_not_wake_watchlist_worker(
 
     assert put.status_code == 200
     assert not app.state.watchlist_wake_event.is_set()
+
+
+async def _audit_rows(sessionmaker_: SessionMaker) -> list[AuditLog]:
+    async with sessionmaker_() as session:
+        return list((await session.execute(select(AuditLog).order_by(AuditLog.id))).scalars())
+
+
+# --------------------------------------------------------------------------- #
+# Relocation (#633): a verified Plex URL or token change that derives the SAME  #
+# machine identifier keeps every session and records one audit row.           #
+# --------------------------------------------------------------------------- #
+async def test_same_server_url_change_keeps_every_session_and_records_one_audit_row(
+    client: httpx.AsyncClient, app: FastAPI, seed: SeedFn, sessionmaker_: SessionMaker
+) -> None:
+    """Moving the anchored server to a new address (a host IP change, or a switch
+    to ``host.docker.internal``) still runs the whole ladder with the re-entered
+    token, but it is not a server change: nobody is signed out, the identity
+    generation stays put, the watchlist worker is not woken to clear snapshots,
+    and the Settings audit list explains the save without exposing the URL or
+    token."""
+    await seed(initialized=True, app_api_key=_API_KEY)
+    await _seed_plex_identity(
+        sessionmaker_, plex_url="http://old:32400", machine_id="SAME-MID-1234"
+    )
+    admin_cookies, admin_csrf = await _admin_session_cookies(app, plex_id=9301, tag="reloc-adm")
+    await _admin_session_cookies(app, plex_id=9302, tag="reloc-other")
+    hub = get_event_hub(app)
+    admin_stream = hub.subscribe(auth_method=AuthMethod.plex_session.value, user_id=1)
+    _ = await admin_stream.get()  # initial sync
+    app.state.watchlist_wake_event = asyncio.Event()
+    generation_before = deps.plex_identity_generation.value
+    probes: list[httpx.Request] = []
+    await _use_transport(
+        app,
+        _repoint_transport(
+            identity="SAME-MID-1234", resources=[_owned_resource("SAME-MID-1234")], probes=probes
+        ),
+    )
+    new_url = "http://host.docker.internal:32400"
+
+    client.cookies.update(admin_cookies)
+    put = await client.put(
+        "/api/v1/settings",
+        json={"plex_url": new_url, "plex_token": _SEED_PLEX_TOKEN},
+        headers=admin_csrf,
+    )
+
+    assert put.status_code == 200
+    # The full ladder still ran against the new address, ownership included.
+    assert [str(p.url) for p in probes if p.url.host != "plex.tv"] == [
+        f"{new_url}/identity",
+        f"{new_url}/library/sections",
+    ]
+    assert any(p.url.host == "plex.tv" for p in probes)
+    async with sessionmaker_() as session:
+        assert await SettingsStore(session).get("plex_url") == new_url
+    assert await _stored_machine_id(sessionmaker_) == "SAME-MID-1234"
+    assert await _active_session_count(sessionmaker_) == 2
+    assert not admin_stream.closed
+    # Other admin tabs refresh the audit list rather than waiting for its poll.
+    assert "audit:sign-outs" in (await admin_stream.get()).topics
+    admin_stream.close()
+    assert deps.plex_identity_generation.value == generation_before
+    assert not app.state.watchlist_wake_event.is_set()
+    assert (await client.get("/api/v1/settings")).status_code == 200
+
+    rows = await _audit_rows(sessionmaker_)
+    assert len(rows) == 1
+    row = rows[0]
+    assert row.action_type == "plex.server_relocated"
+    assert row.entity_type == "plex_server"
+    assert row.user_id is not None  # the session admin who saved it
+    assert row.new_value == {
+        "server_name": "New Box",
+        "server_fingerprint": "SAME-MID",
+        "changed_fields": ["plex_url"],
+        "sessions_revoked": 0,
+    }
+    serialized = json.dumps([row.old_value, row.new_value, row.description])
+    assert "host.docker.internal" not in serialized
+    assert _SEED_PLEX_TOKEN not in serialized
+
+    listed = (await client.get("/api/v1/auth/sign-outs")).json()["entries"]
+    assert [(e["action_type"], e["sessions_revoked"], e["signed_out"]) for e in listed] == [
+        ("plex.server_relocated", 0, False)
+    ]
+    assert listed[0]["description"] == row.description
+
+
+async def test_same_server_token_rotation_is_a_relocation(
+    client: httpx.AsyncClient, app: FastAPI, seed: SeedFn, sessionmaker_: SessionMaker
+) -> None:
+    """Rotating the Plex token for the anchored server is a relocation too: the
+    new token is verified, sessions survive, and the audit row names only which
+    setting changed. An API-key caller has no plex.tv resources to read a name
+    from, so the row takes the verified server's own ``friendlyName``."""
+    await seed(initialized=True, app_api_key=_API_KEY)
+    await _seed_plex_identity(
+        sessionmaker_, plex_url="http://old:32400", machine_id="SAME-MID-1234"
+    )
+    await _admin_session_cookies(app, plex_id=9303, tag="rotate-reloc")
+    app.state.watchlist_wake_event = asyncio.Event()
+    generation_before = deps.plex_identity_generation.value
+    probes: list[httpx.Request] = []
+    await _use_transport(app, _repoint_transport(identity="SAME-MID-1234", probes=probes))
+
+    put = await client.put(
+        "/api/v1/settings",
+        json={"plex_token": "rotated-token"},
+        headers={"X-Api-Key": _API_KEY},
+    )
+
+    assert put.status_code == 200
+    assert all(p.headers.get("X-Plex-Token") == "rotated-token" for p in probes)
+    assert [p.url.path for p in probes] == ["/identity", "/library/sections", "/"]
+    async with sessionmaker_() as session:
+        assert await SettingsStore(session).get("plex_token") == "rotated-token"
+    assert await _active_session_count(sessionmaker_) == 1
+    assert deps.plex_identity_generation.value == generation_before
+    assert not app.state.watchlist_wake_event.is_set()
+    rows = await _audit_rows(sessionmaker_)
+    assert len(rows) == 1
+    assert rows[0].user_id is None  # an API-key save has no acting user
+    assert rows[0].new_value == {
+        "server_name": "Plex Box",
+        "server_fingerprint": "SAME-MID",
+        "changed_fields": ["plex_token"],
+        "sessions_revoked": 0,
+    }
+    assert "rotated-token" not in json.dumps([rows[0].new_value, rows[0].description])
+
+
+async def test_relocation_survives_an_unreadable_server_name(
+    client: httpx.AsyncClient, app: FastAPI, seed: SeedFn, sessionmaker_: SessionMaker
+) -> None:
+    """The name only labels the audit row. Once the ladder has passed, failing
+    to read it must not fail the save: the row falls back to the fingerprint."""
+    await seed(initialized=True, app_api_key=_API_KEY)
+    await _seed_plex_identity(
+        sessionmaker_, plex_url="http://old:32400", machine_id="SAME-MID-1234"
+    )
+    await _admin_session_cookies(app, plex_id=9306, tag="unnamed-reloc")
+    await _use_transport(app, _repoint_transport(identity="SAME-MID-1234", friendly_name=None))
+
+    put = await client.put(
+        "/api/v1/settings",
+        json={"plex_token": "rotated-token"},
+        headers={"X-Api-Key": _API_KEY},
+    )
+
+    assert put.status_code == 200
+    assert await _active_session_count(sessionmaker_) == 1
+    rows = await _audit_rows(sessionmaker_)
+    assert len(rows) == 1
+    assert rows[0].new_value is not None
+    assert rows[0].new_value["server_name"] is None
+    assert rows[0].description is not None
+    assert rows[0].description.startswith("Plex server SAME-MID saved with a new token.")
+
+
+async def test_same_url_token_change_to_a_different_server_still_revokes(
+    client: httpx.AsyncClient, app: FastAPI, seed: SeedFn, sessionmaker_: SessionMaker
+) -> None:
+    """The address alone never decides relocation: a token-only save at the
+    unchanged URL that verifies a DIFFERENT identity is a server change, with
+    today's revoke, generation bump, and watchlist wake, and no relocation row."""
+    await seed(initialized=True, app_api_key=_API_KEY)
+    await _seed_plex_identity(sessionmaker_, plex_url="http://old:32400", machine_id="OLD-MID")
+    await _admin_session_cookies(app, plex_id=9304, tag="same-url-new-server")
+    app.state.watchlist_wake_event = asyncio.Event()
+    generation_before = deps.plex_identity_generation.value
+    await _use_transport(app, _repoint_transport(identity="NEW-MID"))
+
+    put = await client.put(
+        "/api/v1/settings",
+        json={"plex_token": "other-server-token"},
+        headers={"X-Api-Key": _API_KEY},
+    )
+
+    assert put.status_code == 200
+    assert await _stored_machine_id(sessionmaker_) == "NEW-MID"
+    assert await _active_session_count(sessionmaker_) == 0
+    assert deps.plex_identity_generation.value == generation_before + 1
+    assert app.state.watchlist_wake_event.is_set()
+    assert await _audit_rows(sessionmaker_) == []
+
+
+async def test_repoint_without_a_stored_anchor_is_not_a_relocation(
+    client: httpx.AsyncClient, app: FastAPI, seed: SeedFn, sessionmaker_: SessionMaker
+) -> None:
+    """With no anchor there is nothing to compare against, so a verified change
+    cannot be proven to reach the same server: it keeps the revoking path."""
+    await seed(initialized=True, app_api_key=_API_KEY)
+    async with sessionmaker_() as session:
+        store = SettingsStore(session)
+        await store.set("plex_url", "http://old:32400")
+        await store.set("plex_token", _SEED_PLEX_TOKEN)
+        await session.commit()
+    await _admin_session_cookies(app, plex_id=9305, tag="no-anchor")
+    await _use_transport(app, _repoint_transport(identity="SOME-MID"))
+
+    put = await client.put(
+        "/api/v1/settings",
+        json={"plex_url": "http://new:32400", "plex_token": _SEED_PLEX_TOKEN},
+        headers={"X-Api-Key": _API_KEY},
+    )
+
+    assert put.status_code == 200
+    assert await _stored_machine_id(sessionmaker_) == "SOME-MID"
+    assert await _active_session_count(sessionmaker_) == 0
+    assert await _audit_rows(sessionmaker_) == []
 
 
 async def test_explicit_unconfigure_wakes_watchlist_worker(

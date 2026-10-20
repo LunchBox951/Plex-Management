@@ -841,7 +841,8 @@ async def list_automatic_sign_outs_endpoint(
     Deliberately narrow — NOT a generic audit-log browser. Only the
     automatic-sign-out action family
     (:data:`~plex_manager.services.audit_service.AUTOMATIC_SIGN_OUT_ACTION_TYPES`)
-    is selected, so other audit rows (request handoffs, coordinator resets, and
+    and same-server Plex relocations (issue #633, which keep everyone signed in)
+    are selected, so other audit rows (request handoffs, coordinator resets, and
     anything added later) do not become a web resource nobody reviewed.
 
     Admin-only for the same reason the sessions list is: the rows name other

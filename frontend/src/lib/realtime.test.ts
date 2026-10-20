@@ -118,6 +118,15 @@ describe('applyRealtimeEvent', () => {
     expect(invalidate).toHaveBeenCalledWith({ queryKey: queryKeys.appKeyStatus })
   })
 
+  it('refreshes the automatic sign-outs list when a relocation is recorded', () => {
+    const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } })
+    const invalidate = vi.spyOn(qc, 'invalidateQueries')
+
+    applyRealtimeEvent(qc, { seq: 10, topics: ['audit:sign-outs'], reason: 'settings_updated' })
+
+    expect(invalidate).toHaveBeenCalledWith({ queryKey: queryKeys.automaticSignOutsAll })
+  })
+
   it('maps sync and ops topics to broad refetches', () => {
     const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } })
     const invalidate = vi.spyOn(qc, 'invalidateQueries')

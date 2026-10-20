@@ -62,6 +62,8 @@ export const queryKeys = {
   // The durable audit trail of sign-outs the app performed on its own — the
   // answer to "why was I signed out?" that outlives log retention (issue #556).
   automaticSignOuts: (limit: number) => ['auth', 'sign-outs', limit] as const,
+  // Every limit variant of the list above, for invalidation.
+  automaticSignOutsAll: ['auth', 'sign-outs'] as const,
   requests: ['requests'] as const,
   request: (id: number) => ['requests', id] as const,
   // Issue #370 phase 2 — nested UNDER the ['requests'] prefix on purpose: every

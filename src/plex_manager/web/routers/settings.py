@@ -22,6 +22,7 @@ import re
 import secrets
 from collections.abc import AsyncGenerator, Awaitable, Callable, Coroutine
 from contextlib import asynccontextmanager
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Annotated, Any, Final
 
@@ -31,14 +32,14 @@ from sqlalchemy import update
 from sqlalchemy.ext.asyncio import AsyncSession
 from starlette.status import HTTP_409_CONFLICT
 
-from plex_manager.adapters.plex.oauth import PlexTvClient
+from plex_manager.adapters.plex.oauth import PlexTvClient, PlexVerifyError, find_owned_server
 from plex_manager.adapters.service_url import same_service_base
 from plex_manager.config import get_settings
 from plex_manager.db import get_session
 from plex_manager.models import AuthSession, SystemSettings, User
 from plex_manager.ports.library import LibraryPort
 from plex_manager.repositories.log_events import SqlLogEventRepository
-from plex_manager.services import path_visibility
+from plex_manager.services import audit_service, path_visibility
 from plex_manager.services.health_service import SubsystemHealth, TtlCache
 from plex_manager.services.log_capture_service import (
     LogCaptureHandler,
@@ -1552,22 +1553,36 @@ async def revoke_app_key_endpoint(
                 await _revoke_recovery_sessions(session)
 
 
+@dataclass(frozen=True)
+class _VerifiedPlexServer:
+    """A Plex server that passed the full verification ladder.
+
+    ``name`` is the display name used only for audit records: plex.tv's owned
+    resource name for a Plex-session caller, else the server's own
+    ``friendlyName`` (see :func:`_label_relocated_server`). ``None`` when no
+    name could be read.
+    """
+
+    machine_identifier: str
+    name: str | None
+
+
 async def _verify_plex_repoint(
     body: SettingsUpdate,
     session: AsyncSession,
     store: SettingsStore,
     client: httpx.AsyncClient,
     context: AuthContext,
-) -> tuple[bool, str | None]:
+) -> tuple[bool, _VerifiedPlexServer | None]:
     """Detect a Plex repoint and, when verifiable, derive the NEW server's identity.
 
-    Returns ``(identity_changed, derived_machine_id)``:
+    Returns ``(identity_changed, verified_server)``:
 
     * ``(False, None)`` — this PUT does not change the effective ``plex_url`` /
       ``plex_token`` pair (absent/``null`` fields, the masked-secret ``"***"``
       round-trip, and a same-value re-PUT are all NON-changes). No probe is ever
       issued — an ordinary settings save must not pay a live Plex round-trip.
-    * ``(True, machine_id)`` — the identity changes, the EFFECTIVE (post-PUT)
+    * ``(True, verified_server)`` — the pair changes, the EFFECTIVE (post-PUT)
       url+token pair is complete, and the full verification ladder passed. The
       effective value of each half is this PUT's submitted value when it
       carries one, else the currently-stored value.  A masked/omitted token may
@@ -1651,9 +1666,49 @@ async def _verify_plex_repoint(
                 "Re-enter the Plex token so a stored credential is never sent to a new destination."
             ),
         )
-    return True, await _run_plex_identity_ladder(
+    verified = await _run_plex_identity_ladder(
         session, store, client, context, url=effective_url, token=effective_token
     )
+    if verified.name is None and verified.machine_identifier == await store.get(
+        PLEX_MACHINE_ID_SETTING
+    ):
+        verified = await _label_relocated_server(
+            store, client, verified, effective_url, effective_token
+        )
+    return True, verified
+
+
+async def _label_relocated_server(
+    store: SettingsStore,
+    client: httpx.AsyncClient,
+    verified: _VerifiedPlexServer,
+    url: str,
+    token: str,
+) -> _VerifiedPlexServer:
+    """Add the display name a likely relocation's audit row needs (#633).
+
+    Only a Plex-session caller's ownership check reads plex.tv resources, which
+    carry the name, so an API-key relocation asks the just-verified server
+    itself. This runs before any write, because no live probe may run inside
+    the committing transaction, and only when the derived id already matches
+    the anchor. ``write_settings`` still makes the authoritative comparison.
+    Best-effort: the ladder already passed, so a failure to read a label is
+    logged and the row falls back to the identity fingerprint alone.
+    """
+    plex_tv = PlexTvClient(
+        client,
+        client_identifier=await store.get(_CLIENT_ID_SETTING) or _FALLBACK_CLIENT_IDENTIFIER,
+    )
+    try:
+        name = await plex_tv.fetch_server_name(url, token)
+    except PlexVerifyError as exc:
+        _logger.warning(
+            "could not read the Plex server's display name for its relocation audit "
+            "record (%s); the record names it by identity fingerprint only",
+            exc.code,
+        )
+        return verified
+    return _VerifiedPlexServer(verified.machine_identifier, name)
 
 
 async def _run_plex_identity_ladder(
@@ -1664,7 +1719,7 @@ async def _run_plex_identity_ladder(
     *,
     url: str,
     token: str,
-) -> str:
+) -> _VerifiedPlexServer:
     """Derive and fully verify a server's machine identifier. Raises on any rung.
 
     The three rungs documented on :func:`_verify_plex_repoint`, factored out so
@@ -1693,7 +1748,52 @@ async def _run_plex_identity_ladder(
             )
         resources = await plex_tv.fetch_resources(admin_oauth_token)
         assert_admin_owns_server(resources, machine_identifier)
-    return machine_identifier
+        owned = find_owned_server(resources, machine_identifier)
+        return _VerifiedPlexServer(machine_identifier, owned.name if owned is not None else None)
+    return _VerifiedPlexServer(machine_identifier, None)
+
+
+async def _record_plex_relocation(
+    session: AsyncSession,
+    context: AuthContext,
+    server: _VerifiedPlexServer,
+    *,
+    url_changed: bool,
+    token_changed: bool,
+) -> None:
+    """Write the one audit row a same-server Plex repoint owes (#633).
+
+    The row names the server and which settings changed, never their values: a
+    token is a credential and a URL can carry one (userinfo, a token query
+    parameter), so neither belongs in a durable record.
+    """
+    changed_fields = [
+        field
+        for field, changed in (("plex_url", url_changed), ("plex_token", token_changed))
+        if changed
+    ]
+    fingerprint = audit_service.plex_server_fingerprint(server.machine_identifier)
+    subject = f'"{server.name}" ({fingerprint})' if server.name else fingerprint
+    changed = " and ".join(
+        "address" if field == "plex_url" else "token" for field in changed_fields
+    )
+    await audit_service.record(
+        session,
+        actor_user_id=context.user_id,
+        action_type=audit_service.PLEX_SERVER_RELOCATED_ACTION,
+        entity_type=audit_service.PLEX_SERVER_ENTITY_TYPE,
+        entity_id=None,
+        new_value={
+            "server_name": server.name,
+            "server_fingerprint": fingerprint,
+            "changed_fields": changed_fields,
+            "sessions_revoked": 0,
+        },
+        description=(
+            f"Plex server {subject} saved with a new {changed}. "
+            "Same server identity, so no one was signed out."
+        ),
+    )
 
 
 async def _backfill_missing_plex_anchor(
@@ -1745,7 +1845,7 @@ async def _backfill_missing_plex_anchor(
     if not stored_url or not stored_token:
         return None
     try:
-        machine_identifier = await _run_plex_identity_ladder(
+        verified = await _run_plex_identity_ladder(
             session, store, client, context, url=stored_url, token=stored_token
         )
     except Exception as exc:
@@ -1762,7 +1862,7 @@ async def _backfill_missing_plex_anchor(
         "recorded the Plex server anchor this install was missing; entitlement capture "
         "is enabled from the next share-revalidation tick"
     )
-    return machine_identifier
+    return verified.machine_identifier
 
 
 async def _reject_changed_base_stored_credential_reuse(
@@ -1894,6 +1994,17 @@ async def put_settings_endpoint(
     auditable-revoke convention) rather than deleting; API-key auth is
     untouched, so the ``X-Api-Key`` recovery path still works throughout.
 
+    A RELOCATION (#633) is the exception: the ladder verified the SAME
+    ``machineIdentifier`` that is already anchored, so the change is a new
+    address or a rotated token for the server every session was already
+    authorized against. It runs the identical verification (including token
+    re-entry for a new destination) but commits in place: no session
+    revocation, no identity-generation bump, no watchlist snapshot-cleanup
+    wake, no Plex-session stream close, and one secret-free ``AuditLog`` row
+    (:func:`_record_plex_relocation`). The comparison reads the anchor in the
+    transaction that commits, and a missing anchor never counts as a match, so
+    a different or unknown identity keeps the revoking path above.
+
     An UNVERIFIABLE identity change — the effective pair is incomplete (a
     half-configured install, or an explicit ``""`` clear) — cannot be probed:
     the write proceeds, the STALE cached id is dropped (nothing may keep
@@ -1945,9 +2056,13 @@ async def put_settings_endpoint(
         store = SettingsStore(session)
         await _reject_changed_base_stored_credential_reuse(body, store)
         # Verify BEFORE any write: a failed verification must leave nothing behind.
-        plex_identity_changed, machine_identifier = await _verify_plex_repoint(
+        plex_identity_changed, verified_server = await _verify_plex_repoint(
             body, session, store, client, context
         )
+        machine_identifier = verified_server.machine_identifier if verified_server else None
+        # Decided inside ``write_settings`` against the anchor read in the
+        # transaction that commits, never against a pre-boundary snapshot.
+        server_relocated = False
         # A re-save that changes nothing is not a repoint -- but on an install
         # that never recorded one, it is the operator's chance to establish the
         # anchor #484 capture needs. Verified by the same ladder; best-effort.
@@ -1988,6 +2103,9 @@ async def put_settings_endpoint(
         )
 
         async def write_settings() -> None:
+            nonlocal server_relocated
+            previous_plex_url = await store.get("plex_url")
+            previous_anchor = await store.get(PLEX_MACHINE_ID_SETTING)
             for field in body.model_fields_set:
                 value = getattr(body, field)
                 if value is None:
@@ -2001,6 +2119,19 @@ async def put_settings_endpoint(
             if plex_identity_changed:
                 if machine_identifier is None:
                     await store.delete(PLEX_MACHINE_ID_SETTING)
+                elif verified_server is not None and previous_anchor == machine_identifier:
+                    # Relocation (#633): the verified server IS the anchored one,
+                    # reached at a new address or with a rotated token. Every
+                    # session's authority still derives from the same server, so
+                    # nothing is revoked. A missing anchor never qualifies.
+                    server_relocated = True
+                    await _record_plex_relocation(
+                        session,
+                        context,
+                        verified_server,
+                        url_changed=previous_plex_url != await store.get("plex_url"),
+                        token_changed="plex_token" in changing_secret_fields,
+                    )
                 else:
                     await store.set(PLEX_MACHINE_ID_SETTING, machine_identifier)
                     await session.execute(
@@ -2023,9 +2154,13 @@ async def put_settings_endpoint(
             old-server Plex-session streams open and probe caches stale with
             the repoint already committed. The plain path calls it directly
             after its own commit. Reads ``written_fields`` /
-            ``plex_identity_changed`` at CALL time, after ``write_settings``
-            has populated them.
+            ``server_relocated`` at CALL time, after ``write_settings`` has
+            populated them.
             """
+            # A relocation (#633) keeps the anchored server, so none of the
+            # identity-change signals below apply to it: no counter bump, no
+            # watchlist snapshot cleanup, no Plex-session stream close.
+            server_replaced = plex_identity_changed and not server_relocated
             # Bump the process-local plex-identity generation AFTER the repoint's
             # machine-id write (+ any session sweep) is durably committed, and (on
             # the boundary path) while ``secret_rotation_lock`` is still held
@@ -2047,7 +2182,7 @@ async def put_settings_endpoint(
             # so this always runs under the lock. (A clear sweeps no sessions -- an
             # incomplete identity mints none anyway -- but the signal is still owed
             # to any sign-in that already passed its access decision.)
-            if plex_identity_changed:
+            if server_replaced:
                 deps.plex_identity_generation.value += 1
 
             # Every step below the bump is ISOLATED (issue #423): once the writes
@@ -2071,7 +2206,7 @@ async def put_settings_endpoint(
             # scheduled tick (hours/days away) despite the operator explicitly
             # walking away from Plex. The worker owns this process-local event.
             try:
-                if plex_identity_changed or written_fields.intersection(
+                if server_replaced or written_fields.intersection(
                     {"watchlist_sync_enabled", "watchlist_sync_interval_minutes"}
                 ):
                     wake_event = getattr(request.app.state, "watchlist_wake_event", None)
@@ -2114,7 +2249,7 @@ async def put_settings_endpoint(
                         _log_invalidation_step_failure(f"health_cache_invalidate:{subsystem}")
 
             try:
-                if plex_identity_changed and machine_identifier is not None:
+                if server_replaced and machine_identifier is not None:
                     close_realtime_streams(
                         request.app,
                         reason="plex_server_repointed",
@@ -2128,6 +2263,10 @@ async def put_settings_endpoint(
                     topics = ["settings", "ops:health"]
                     if written_fields.intersection(_UPDATE_POLICY_FIELDS):
                         topics.append("updates")
+                    if server_relocated:
+                        # The relocation's audit row is listed under Settings ->
+                        # Automatic sign-outs, which no settings topic refreshes.
+                        topics.append("audit:sign-outs")
                     publish_realtime(
                         request.app,
                         tuple(topics),
