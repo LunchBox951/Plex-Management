@@ -472,8 +472,8 @@ class AutomaticSignOut(BaseModel):
     (issue #556). Every field here comes from the ``AuditLog`` row the sweep
     wrote in the same transaction as the revocation.
 
-    ``action_type`` keeps the two causes apart, because they mean different
-    things to the person affected:
+    ``action_type`` keeps the causes apart, because they mean different things
+    to the person affected:
 
     * ``user.share_revoked`` — plex.tv confirmed the account no longer reaches
       this server. Access really is gone.
@@ -481,7 +481,12 @@ class AutomaticSignOut(BaseModel):
       the share could not be checked at all. Access was NOT removed; signing in
       with Plex again restores it.
 
-    Either action type may carry the ``_admin_exempt`` suffix, which records a
+    * ``plex.server_relocated`` — a Plex URL or token save that verified the
+      SAME server identity (#633). Nobody was signed out: ``user_id`` and
+      ``username`` are null, ``sessions_revoked`` is 0, and ``description``
+      names the server and which settings changed.
+
+    Either sign-out action type may carry the ``_admin_exempt`` suffix, which records a
     verdict deliberately NOT acted on for an owner/admin (ADR-0005's
     never-locked-out rule). Those rows report ``signed_out: false`` — they are
     the operator's cue to revoke by hand if the removal is genuine.
