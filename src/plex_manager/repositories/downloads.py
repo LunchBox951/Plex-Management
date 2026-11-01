@@ -14,6 +14,7 @@ from typing import TYPE_CHECKING, Any, cast
 
 from sqlalchemy import CursorResult, delete, exists, or_, select, update
 
+from plex_manager.domain.media_identity import REVIEWABLE_REQUEST_STATUSES
 from plex_manager.models import (
     Download,
     DownloadCoverageClaim,
@@ -605,7 +606,8 @@ class SqlDownloadRepository:
                 or_(
                     Download.status.notin_(_TERMINAL_DOWNLOAD_STATUSES),
                     (Download.status == "no_acceptable_release")
-                    & Download.import_review_reason.is_not(None),
+                    & Download.import_review_reason.is_not(None)
+                    & MediaRequest.status.in_(REVIEWABLE_REQUEST_STATUSES),
                     (Download.status == "failed")
                     & Download.payload_rejection.is_not(None)
                     & (Download.failed_at >= datetime.now(UTC) - timedelta(days=1)),

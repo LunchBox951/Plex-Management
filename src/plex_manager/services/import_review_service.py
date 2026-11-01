@@ -9,6 +9,7 @@ from typing import TYPE_CHECKING
 from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 
+from plex_manager.domain.media_identity import REVIEWABLE_REQUEST_STATUSES
 from plex_manager.domain.state_machine import DownloadState
 from plex_manager.logsafe import safe_int
 from plex_manager.models import Blocklist, BlocklistReason, Download, RequestStatus
@@ -23,9 +24,6 @@ if TYPE_CHECKING:
     from plex_manager.ports.download_client import DownloadClientPort
 
 _logger = logging.getLogger(__name__)
-_REQUEST_SEARCHABLE = frozenset(
-    {"pending", "searching", "no_acceptable_release", "downloading", "import_blocked"}
-)
 
 
 class ImportReviewConflictError(Exception):
@@ -46,7 +44,7 @@ async def hold_movie(session: AsyncSession, row: Download, reason: str) -> None:
     if not changed or not await SqlRequestRepository(session).set_status_if_in(
         request_id,
         RequestStatus.searching.value,
-        _REQUEST_SEARCHABLE,
+        REVIEWABLE_REQUEST_STATUSES,
     ):
         await session.rollback()
         raise ImportReviewConflictError("request changed during runtime verification")
@@ -86,7 +84,7 @@ async def approve_movie(
     request_id = row.media_request_id
     requests = SqlRequestRepository(session)
     request = await requests.get(request_id)
-    if request is None or request.status not in _REQUEST_SEARCHABLE:
+    if request is None or request.status not in REVIEWABLE_REQUEST_STATUSES:
         raise ImportReviewConflictError("the request has already completed or was cancelled")
     downloads = SqlDownloadRepository(session)
     replacement = await downloads.find_active_for_request(request_id)
@@ -132,7 +130,7 @@ async def approve_movie(
             or row.import_review_reason is None
             or row.status != "no_acceptable_release"
             or request is None
-            or request.status not in _REQUEST_SEARCHABLE
+            or request.status not in REVIEWABLE_REQUEST_STATUSES
         ):
             raise ImportReviewConflictError("request changed while stopping the replacement")
         replacement = await downloads.find_active_for_request(request_id)
@@ -153,7 +151,9 @@ async def approve_movie(
             "import_pending",
             frozenset({"no_acceptable_release"}),
             clear_failed_reason=True,
-        ) or not await requests.set_status_if_in(request_id, "downloading", _REQUEST_SEARCHABLE):
+        ) or not await requests.set_status_if_in(
+            request_id, "downloading", REVIEWABLE_REQUEST_STATUSES
+        ):
             raise ImportReviewConflictError("request changed during approval")
         row.import_review_approved = True
         if row.import_review_blocklist_id is not None:

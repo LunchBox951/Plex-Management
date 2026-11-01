@@ -2,6 +2,10 @@
 
 import math
 
+REVIEWABLE_REQUEST_STATUSES = frozenset(
+    {"pending", "searching", "no_acceptable_release", "downloading", "import_blocked"}
+)
+
 
 def movie_runtime_conflict(
     actual_seconds: float | None, expected_minutes: int | None
