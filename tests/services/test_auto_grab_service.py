@@ -34,6 +34,7 @@ from plex_manager.models import (
     SeasonRequest,
 )
 from plex_manager.ports.download_client import DownloadClientPort
+from plex_manager.ports.indexer import IndexerSearchResults
 from plex_manager.ports.repositories import DownloadRecord
 from plex_manager.services import auto_grab_service, log_capture_service, purge_service
 from plex_manager.services.auto_grab_service import (
@@ -341,6 +342,34 @@ async def test_search_raise_leaves_state_unchanged_and_propagates(
         assert row.status == RequestStatus.pending
         assert row.search_attempts == 0
         assert row.next_search_at is None
+
+
+@pytest.mark.parametrize("source_works", [False, True])
+async def test_partial_search_grabs_a_usable_release_but_never_parks_after_source_failure(
+    sessionmaker_: SessionMaker,
+    source_works: bool,
+) -> None:
+    class PartialProwlarr(FakeProwlarr):
+        async def search(self, request: IndexerSearchRequest) -> list[CandidateRelease]:
+            return IndexerSearchResults(await super().search(request), complete=False)
+
+    title = "Some.Movie.2020.1080p.WEB-DL.x264-GROUP"
+    request_id = await _seed_movie(sessionmaker_, tmdb_id=603)
+    prowlarr = PartialProwlarr([candidate(title, magnet=False)])
+    if source_works:
+        prowlarr = PartialProwlarr([candidate(title, info_hash="a" * 40)])
+    qbt = FakeQbittorrent(source_errors=set() if source_works else {f"http://idx.local/{title}"})
+    if source_works:
+        result = await _run(sessionmaker_, prowlarr, qbt)
+        assert result.grabbed == 1
+        assert result.no_acceptable == 0
+    else:
+        with pytest.raises(IndexerError):
+            await _run(sessionmaker_, prowlarr, qbt)
+        async with sessionmaker_() as session:
+            request = await session.get(MediaRequest, request_id)
+            assert request is not None and request.status == RequestStatus.pending
+            assert request.search_attempts == 0 and request.next_search_at is None
 
 
 # --------------------------------------------------------------------------- #

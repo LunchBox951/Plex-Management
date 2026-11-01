@@ -5,10 +5,12 @@ from __future__ import annotations
 import logging
 from datetime import UTC, datetime
 
+import httpx
 import pytest
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from plex_manager.adapters.parser.guessit_adapter import GuessitParser
+from plex_manager.adapters.prowlarr import IndexerError, ProwlarrIndexer
 from plex_manager.domain.quality_profile import default_profile
 from plex_manager.domain.quality_service import RejectionReason
 from plex_manager.domain.release import CandidateRelease
@@ -18,6 +20,72 @@ from plex_manager.services import decision_service, log_capture_service
 from tests.web.fakes import FakeProwlarr, candidate, good_and_cam_candidates
 
 SessionMaker = async_sessionmaker[AsyncSession]
+
+
+@pytest.mark.parametrize(
+    "title, blocked",
+    [
+        ("Some.Movie.2020.CAM.x264-GROUP", False),
+        ("Other.Movie.2020.1080p.WEB-DL.x264-GROUP", False),
+        ("Some.Movie.2020.1080p.WEB-DL.x264-GROUP", True),
+    ],
+)
+async def test_incomplete_search_remains_retryable_when_all_healthy_results_are_rejected(
+    sessionmaker_: SessionMaker,
+    title: str,
+    blocked: bool,
+) -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/api/v1/indexer":
+            return httpx.Response(200, json=[{"id": 1, "enable": True}, {"id": 2, "enable": True}])
+        if request.url.params.get("indexerIds") == "2":
+            return httpx.Response(504)
+        return httpx.Response(
+            200,
+            json=[
+                {
+                    "guid": "https://healthy.test/release",
+                    "title": title,
+                    "size": 4_000_000_000,
+                    "indexerId": 1,
+                    "indexer": "Healthy",
+                    "magnetUrl": "magnet:?xt=urn:btih:" + "a" * 40,
+                    "infoHash": "a" * 40,
+                    "protocol": "torrent",
+                    "publishDate": "2026-10-31T00:00:00Z",
+                }
+            ],
+        )
+
+    async with sessionmaker_() as session:
+        if blocked:
+            session.add(
+                Blocklist(
+                    source_title=title,
+                    torrent_hash="a" * 40,
+                    tmdb_id=603,
+                    media_type="movie",
+                    reason=BlocklistReason.failed,
+                )
+            )
+            await session.commit()
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+            result = await decision_service.preview(
+                ProwlarrIndexer(client, "http://prowlarr.test", "test-key"),
+                GuessitParser(),
+                default_profile(),
+                SqlBlocklistRepository(session),
+                tmdb_id=603,
+                title="Some Movie",
+                media_type="movie",
+                year=2020,
+            )
+
+    assert result.accepted == ()
+    assert not result.search_complete
+    assert not result.no_acceptable_release
+    with pytest.raises(IndexerError):
+        decision_service.require_complete_search(result)
 
 
 async def test_preview_accepts_good_rejects_prerelease(sessionmaker_: SessionMaker) -> None:

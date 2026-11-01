@@ -27,6 +27,7 @@ from plex_manager.models import (
     RequestStatus,
     SeasonRequest,
 )
+from plex_manager.ports.indexer import IndexerSearchResults
 from plex_manager.ports.metadata import EpisodeInfo
 from plex_manager.ports.repositories import DownloadRecord
 from plex_manager.repositories.season_episode_states import SqlSeasonEpisodeStateRepository
@@ -151,6 +152,37 @@ async def test_fallback_grabs_a_missing_episode_when_no_pack_is_acceptable(
         )
         assert download["season"] == 1
         assert download["episodes_json"] == [1]
+
+
+async def test_partial_pack_search_still_uses_healthy_episode_fallback_results(
+    sessionmaker_: SessionMaker,
+) -> None:
+    class PartialProwlarr(_PerTmdbProwlarr):
+        async def search(self, request: IndexerSearchRequest) -> list[CandidateRelease]:
+            return IndexerSearchResults(await super().search(request), complete=False)
+
+    await _seed_tv_season(sessionmaker_, tmdb_id=2001)
+    prowlarr = PartialProwlarr(
+        {
+            2001: [
+                candidate(
+                    "Some.Show.S01E01.1080p.WEB-DL.x264-GROUP",
+                    info_hash="a" * 40,
+                )
+            ]
+        }
+    )
+    result = await _run(
+        sessionmaker_,
+        prowlarr,
+        FakeQbittorrent(),
+        metadata=FakeTmdb(
+            season_episodes={(2001, 1): [EpisodeInfo(episode_number=1, air_date=date(2026, 1, 1))]},
+        ),
+    )
+    assert result.grabbed == 1
+    assert result.season_episode_fallback_grabs == 1
+    assert result.no_acceptable == 0
 
 
 async def test_episode_fallback_search_shares_the_per_cycle_search_budget(

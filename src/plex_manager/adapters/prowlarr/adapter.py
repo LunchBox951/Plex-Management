@@ -44,6 +44,7 @@ from plex_manager.adapters.service_url import InvalidServiceUrl, ServiceUrl
 from plex_manager.domain.release import CandidateRelease, IndexerSearchRequest
 from plex_manager.headersafe import header_value_error
 from plex_manager.logsafe import safe_int
+from plex_manager.ports.indexer import IndexerSearchResults
 
 __all__ = ["IndexerError", "IndexerRateLimitError", "ProwlarrIndexer"]
 
@@ -274,7 +275,7 @@ class ProwlarrIndexer:
         if indexer_ids is None:
             # Discovery failed: preserve the existing aggregate fallback rather
             # than inventing an empty result or guessing which indexers exist.
-            return await self._search_one(request, priorities)
+            return IndexerSearchResults(await self._search_one(request, priorities), complete=False)
         if not indexer_ids:
             return []
         semaphore = asyncio.Semaphore(_SEARCH_CONCURRENCY)
@@ -321,7 +322,7 @@ class ProwlarrIndexer:
                 # Partial failure cannot establish that no release exists. Keep
                 # the request retryable instead of applying a negative backoff.
                 raise failures[0]
-            return _dedupe_by_guid(candidates)
+            return IndexerSearchResults(_dedupe_by_guid(candidates), complete=not failures)
         finally:
             for task in tasks:
                 if not task.done():

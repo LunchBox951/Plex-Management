@@ -730,6 +730,7 @@ async def _attempt_episode_fallback(
     )
     fb_candidates = fb_result.accepted[:MAX_GRAB_ATTEMPTS_PER_SCOPE]
     if not fb_candidates:
+        decision_service.require_complete_search(fb_result)
         return _EpisodeFallbackOutcome(settled=False, searched=True)
 
     source_failures = 0
@@ -838,6 +839,7 @@ async def _attempt_episode_fallback(
                 len(fb_candidates),
                 extra={"request_id": safe_int(scope.request_id)},
             )
+    decision_service.require_complete_search(fb_result)
     return _EpisodeFallbackOutcome(settled=False, source_failures=source_failures, searched=True)
 
 
@@ -1476,6 +1478,7 @@ async def run_grab_cycle(
                     last_grab_error = fb_outcome.grab_error
 
         if park_scope:
+            decision_service.require_complete_search(result)
             # Parking resolves the scope one way or the other, so clear any stale
             # cooldown (GrabError is its only feeder). ``_park`` re-checks for a
             # racing active download and, if one appeared, skips the park entirely

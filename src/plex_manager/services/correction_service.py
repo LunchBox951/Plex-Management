@@ -1328,6 +1328,8 @@ async def report_issue(
             episodes=None,
             multi_season_intent=multi_season_intent,
         )
+        if not result.accepted:
+            decision_service.require_complete_search(result)
     except _INDEXER_ERRORS as exc:
         # The re-search could not reach the indexer AFTER the blocklist/purge/reset
         # already committed. This is OPERATIONAL (Prowlarr down / rate-limited), NOT
@@ -1427,7 +1429,12 @@ async def report_issue(
                             extra=log_extra,
                         )
                         break
-                if park_scope:
+                if park_scope and not result.search_complete:
+                    _logger.warning(
+                        "replacement search incomplete; leaving request searching for retry",
+                        extra=log_extra,
+                    )
+                if park_scope and result.search_complete:
                     # Every attempted replacement was per-release unusable (list or
                     # attempt cap exhausted): the SAME honest park an empty preview
                     # takes -- never a silent 'searching'.
