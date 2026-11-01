@@ -35,6 +35,7 @@ from plex_manager.adapters.filesystem.local import LocalFileSystem, LocalFileSys
 from plex_manager.adapters.parser.guessit_adapter import GuessitParser
 from plex_manager.adapters.plex.library import PlexLibraryError
 from plex_manager.adapters.qbittorrent.adapter import QbittorrentError
+from plex_manager.adapters.tmdb import TmdbApiError, TmdbAuthError
 from plex_manager.db import Base, enable_sqlite_fk_enforcement
 from plex_manager.domain.quality import WEBDL1080P, QualitySource
 from plex_manager.domain.quality_profile import default_profile
@@ -7028,3 +7029,39 @@ async def test_import_scan_error_never_rejects_payload(
     assert not qbt.removed
     async with sessionmaker_() as session:
         assert not (await session.execute(select(Blocklist))).scalars().all()
+
+
+@pytest.mark.parametrize("metadata_error", [TmdbApiError, TmdbAuthError])
+async def test_unavailable_optional_runtime_metadata_does_not_block_valid_import(
+    tmp_path: Path,
+    sessionmaker_: SessionMaker,
+    metadata_error: type[RuntimeError],
+) -> None:
+    class UnavailableRuntime(FakeTmdb):
+        async def get_movie(self, tmdb_id: int) -> MovieMetadata | None:
+            raise metadata_error("runtime metadata unavailable")
+
+    video = tmp_path / "downloads" / "The.Matrix.1999.1080p.WEB-DL.x264-GRP.mkv"
+    _make_video(video)
+    root = tmp_path / "library"
+    root.mkdir()
+    download_id, _request_id = await _seed(
+        sessionmaker_,
+        request_status=RequestStatus.downloading,
+        download_status="import_pending",
+    )
+    async with sessionmaker_() as session:
+        result = await import_download(
+            download_id=download_id,
+            fs=LocalFileSystem(),
+            media_probe=FakeMediaProbe(),
+            library=FakeLibrary(),
+            qbt=_qbt(video),
+            parser=GuessitParser(),
+            profile=default_profile(),
+            session=session,
+            movies_root=str(root),
+            metadata=UnavailableRuntime(),
+        )
+    assert result is not None and result.status == "imported"
+    assert (root / "The Matrix (1999)" / "The Matrix (1999).mkv").exists()

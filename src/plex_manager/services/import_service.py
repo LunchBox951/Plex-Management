@@ -46,7 +46,7 @@ from sqlalchemy.exc import IntegrityError
 
 from plex_manager.adapters.filesystem.local import LocalFileSystemError
 from plex_manager.adapters.plex.library import PlexAuthError, PlexLibraryError
-from plex_manager.adapters.tmdb import TmdbApiError
+from plex_manager.adapters.tmdb import TmdbApiError, TmdbAuthError
 from plex_manager.domain.import_validation import (
     EpisodeImportResult,
     VideoFile,
@@ -1496,7 +1496,7 @@ async def _import_download_locked(
     if metadata is not None and not row.import_review_approved and not entered_importing:
         try:
             movie = await metadata.get_movie(request.tmdb_id)
-        except TmdbApiError as exc:
+        except (TmdbApiError, TmdbAuthError) as exc:
             _logger.warning(
                 "runtime identity metadata unavailable (%s); retaining normal import checks",
                 type(exc).__name__,
