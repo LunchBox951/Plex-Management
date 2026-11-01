@@ -11,6 +11,7 @@ default run; an OPTIONAL live smoke test is env-guarded.
 
 from __future__ import annotations
 
+import asyncio
 import os
 from typing import Any
 
@@ -126,6 +127,49 @@ async def test_search_maps_and_dedupes_by_guid() -> None:
     assert first.publish_date.year == 2023
     assert second.leechers == 10  # derived from peers - seeders
     assert second.publish_date.year == 1970  # malformed date -> epoch
+
+
+async def test_search_keeps_healthy_results_when_another_indexer_times_out() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/api/v1/indexer":
+            return httpx.Response(200, json=INDEXERS[:2])
+        if request.url.params.get("indexerIds") == "1":
+            return httpx.Response(200, json=[SEARCH_RESULTS[1]])
+        raise httpx.ReadTimeout("indexer search timed out", request=request)
+
+    results = await _adapter(handler).search(
+        IndexerSearchRequest(media_type="movie", tmdb_id=27205)
+    )
+
+    assert [result.guid for result in results] == ["https://indexer-a/details/1"]
+
+
+async def test_search_deadline_keeps_completed_results_and_cancels_the_slow_search() -> None:
+    async def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/api/v1/indexer":
+            return httpx.Response(200, json=INDEXERS[:2])
+        if request.url.params.get("indexerIds") == "2":
+            await asyncio.sleep(10)
+        return httpx.Response(200, json=[SEARCH_RESULTS[1]])
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        adapter = ProwlarrIndexer(client, BASE_URL, API_KEY, search_timeout=0.05)
+        results = await asyncio.wait_for(adapter.search(IndexerSearchRequest()), timeout=1)
+    assert [result.guid for result in results] == ["https://indexer-a/details/1"]
+
+
+async def test_partial_failure_with_no_results_is_retryable_not_a_negative_search() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/api/v1/indexer":
+            return httpx.Response(200, json=INDEXERS[:2])
+        return (
+            httpx.Response(200, json=[])
+            if request.url.params.get("indexerIds") == "1"
+            else httpx.Response(503)
+        )
+
+    with pytest.raises(IndexerError):
+        await _adapter(handler).search(IndexerSearchRequest())
 
 
 async def test_search_drops_usenet_releases() -> None:

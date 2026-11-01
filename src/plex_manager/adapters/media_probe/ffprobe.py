@@ -37,7 +37,7 @@ _VIDEO_STREAM_SELECTOR: Final = "V"
 _MAX_PACKETS: Final = 32
 _PACKET_READ_INTERVAL: Final = f"%+#{_MAX_PACKETS}"
 _SHOW_ENTRIES: Final = (
-    "format=format_name:stream=index,codec_type,codec_name:"
+    "format=format_name,duration:stream=index,codec_type,codec_name:"
     "stream_disposition=attached_pic:packet=stream_index"
 )
 _UNKNOWN_CODEC_NAMES: Final = frozenset({"", "unknown", "none", "n/a"})
@@ -238,4 +238,16 @@ class FfprobeMediaProbe:
             raise MediaProbeError(
                 "candidate has no readable packet from a known primary video stream"
             )
-        return MediaProbeResult(container=container, video_codec=video_codec)
+        duration: float | None = None
+        raw_duration = (_mapping(payload.get("format")) or {}).get("duration")
+        if isinstance(raw_duration, (str, int, float)) and not isinstance(raw_duration, bool):
+            try:
+                parsed_duration = float(raw_duration)
+            except ValueError:
+                pass
+            else:
+                if math.isfinite(parsed_duration) and parsed_duration > 0:
+                    duration = parsed_duration
+        return MediaProbeResult(
+            container=container, video_codec=video_codec, duration_seconds=duration
+        )

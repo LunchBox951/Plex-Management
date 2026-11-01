@@ -587,6 +587,21 @@ describe('Queue actions', () => {
 })
 
 describe('Queue — Retry import (import_blocked only)', () => {
+  it('offers Import anyway for a retained runtime conflict while search continues', () => {
+    h.importDownload.mockResolvedValue(queueItem({ status: 'import_pending' }))
+    h.queue = [queueItem({ id: 7, status: 'no_acceptable_release',
+      import_review_reason: 'Runtime differs substantially: file 86 minutes, expected 173 minutes.',
+      failed_reason: 'Searching for another release; you can import this file anyway.',
+    })]
+
+    render(<Queue />)
+
+    expect(screen.getByText('Needs review')).toBeInTheDocument()
+    expect(screen.getByText(/stops any replacement download and keeps its files/i)).toBeInTheDocument()
+    fireEvent.click(screen.getByRole('button', { name: /import anyway/i }))
+    expect(h.importDownload).toHaveBeenCalledWith({ downloadId: 7, importAnyway: true })
+  })
+
   it('renders a Retry import button for an import_blocked download and retries it', () => {
     h.importDownload.mockResolvedValue(queueItem({ status: 'import_blocked' }))
     h.queue = [queueItem({ id: 7, status: 'import_blocked' })]

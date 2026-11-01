@@ -941,10 +941,13 @@ export function useMarkFailed() {
 export function useImportDownload() {
   const qc = useQueryClient()
   return useMutation({
-    mutationFn: async (downloadId: number): Promise<QueueItem> =>
+    mutationFn: async (input: number | { downloadId: number; importAnyway: true }): Promise<QueueItem> =>
       unwrap(
         await client.POST('/api/v1/queue/{download_id}/import', {
-          params: { path: { download_id: downloadId } },
+          params: {
+            path: { download_id: typeof input === 'number' ? input : input.downloadId },
+            query: { import_anyway: typeof input !== 'number' },
+          },
         }),
       ),
     onSuccess: () => {

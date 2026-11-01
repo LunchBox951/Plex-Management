@@ -97,7 +97,8 @@ class DecisionResult:
 
     ``accepted`` is sorted best-first. ``rejected`` pairs each discarded candidate
     with its (surfaced, never-swallowed) reason. ``no_acceptable_release`` is True
-    iff ``accepted`` is empty.
+    when the complete candidate set has no accepted release. Services retain
+    ``search_complete=False`` when only partial indexer data was obtained.
 
     Both collections are immutable tuples (issue #106): a frozen dataclass blocks
     reassigning ``result.accepted`` but NOT mutating a plain list in place, and a
@@ -109,6 +110,7 @@ class DecisionResult:
     accepted: tuple[ScoredRelease, ...]
     rejected: tuple[tuple[CandidateRelease, RejectionReason], ...]
     no_acceptable_release: bool
+    search_complete: bool = True
 
 
 def decide(

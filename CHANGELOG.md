@@ -7,6 +7,7 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 ## [Unreleased]
 
 ### Added
+- Movie imports with a runtime discrepancy of at least 30 minutes and 40% are retained for review outside Plex while automatic replacement searching continues. The queue offers **Import anyway**, which keeps the original validation checks and stops an active replacement without deleting its files. Missing runtime metadata does not block import. Ships migration `3af8b3f3dbc5` and ADR-0033.
 - Capture-only section entitlements (PR-3 of the auth-revalidation design):
   the share sweep and a detached post-sign-in step now record each shared
   user's Plex section entitlements (no enforcement yet — that is PR-5), with
@@ -70,6 +71,8 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - `frontend-deps` group bumps: `react-router`, `eslint`, `typescript-eslint`, `globals` and `vitest` 5 (#593), then `react`/`react-dom` 19.3, `react-router` 8.4, `@radix-ui/react-dialog`, `@radix-ui/react-toast`, `@tanstack/react-query`, `vite` 8.3 and other dev dependencies (#611, #655). Transitive frontend lockfile bumps: `browserslist` 4.28.9 (#594), `js-yaml` 4.3.2 (#596), `undici` 8.11.2 (#606) and `brace-expansion` 2.1.7 (#610).
 
 ### Fixed
+- Prowlarr searches retain results from healthy indexers when another indexer fails or times out. Searches use bounded concurrency and per-indexer deadlines; an incomplete search with no usable results remains retryable.
+- A blocklisted torrent can no longer be grabbed again through a hashless result from another indexer. The grab checks the resolved torrent hash before accepting or reusing its download row and preserves existing tracked payloads.
 - Changing the Plex URL or token in Settings no longer signs everyone out when the change reaches the same server. The save still runs the full verification (including token re-entry for a new address), and a matching `machineIdentifier` now commits in place: sessions stay valid and the watchlist worker is not woken to clear snapshots. Each such save writes one audit record, without the URL or token, that names the server and appears in Settings → Automatic sign-outs. A change that reaches a different server, or one made before a server identity was recorded, still signs everyone out (#633).
 - Media probe: an ffprobe that cannot run (exit 126 or 127, such as a missing shared library) now leaves the download `import_blocked` with a retryable "verification unavailable" reason instead of rejecting, blocklisting and re-searching every completed release (#618).
 - Import: a crash-resumed import whose torrent has left qBittorrent and whose download holds no video now moves to a visible, retryable `import_blocked` that names the missing torrent, instead of retrying silently every cycle. Retry Import and Mark Failed recover it; nothing is blocklisted or removed automatically (#619).

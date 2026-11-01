@@ -27,8 +27,10 @@ rank/grab, rather than caught only later at import time.
 from __future__ import annotations
 
 import logging
+from dataclasses import replace
 from typing import TYPE_CHECKING
 
+from plex_manager.adapters.prowlarr import IndexerError
 from plex_manager.domain.blocklist import BlocklistedRelease
 from plex_manager.domain.blocklist import is_blocklisted as _is_blocklisted
 from plex_manager.domain.decision_engine import DecisionResult, decide
@@ -37,6 +39,7 @@ from plex_manager.domain.quality_service import RejectionReason
 from plex_manager.domain.release import IndexerSearchRequest, MediaType
 from plex_manager.domain.season_pack import covers_requested_episodes
 from plex_manager.logsafe import safe_int, safe_text
+from plex_manager.ports.indexer import IndexerSearchResults
 from plex_manager.services.log_capture_service import DECISION_TELEMETRY_LOGGER_NAME
 
 if TYPE_CHECKING:
@@ -48,7 +51,7 @@ if TYPE_CHECKING:
     from plex_manager.ports.parser import ParserPort
     from plex_manager.ports.repositories import BlocklistRepository
 
-__all__ = ["preview", "preview_episode_fallback"]
+__all__ = ["preview", "preview_episode_fallback", "require_complete_search"]
 
 # The constant equals this module's dotted path (i.e. ``__name__``); constructing
 # the logger FROM it (retention-telemetry precedent) guarantees the emitter can
@@ -98,6 +101,12 @@ async def _blocklist_hook(
         )
 
     return _blocklisted
+
+
+def require_complete_search(result: DecisionResult) -> None:
+    """Refuse a negative conclusion when unsearched sources may still have releases."""
+    if not result.search_complete:
+        raise IndexerError("Prowlarr search incomplete; no usable release was obtained")
 
 
 async def preview(
@@ -215,6 +224,12 @@ async def preview(
     )
     _log_multi_season_pack_rejections(result, tmdb_id=tmdb_id, media_type=media_type, season=season)
     _log_not_season_pack_rejections(result, tmdb_id=tmdb_id, media_type=media_type, season=season)
+    if isinstance(candidates, IndexerSearchResults):
+        result = replace(
+            result,
+            search_complete=candidates.complete,
+            no_acceptable_release=result.no_acceptable_release and candidates.complete,
+        )
     return result
 
 
@@ -282,6 +297,12 @@ async def preview_episode_fallback(
         episode_subset=missing_episodes,
     )
     _log_episode_not_needed_rejections(result, tmdb_id=tmdb_id, season=season)
+    if isinstance(candidates, IndexerSearchResults):
+        result = replace(
+            result,
+            search_complete=candidates.complete,
+            no_acceptable_release=result.no_acceptable_release and candidates.complete,
+        )
     return result
 
 

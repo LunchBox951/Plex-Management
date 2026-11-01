@@ -49,6 +49,7 @@ from plex_manager.models import (
     User,
 )
 from plex_manager.ports.download_client import AddResult
+from plex_manager.ports.indexer import IndexerSearchResults
 from plex_manager.ports.metadata import MovieMetadata, TvMetadata
 from plex_manager.repositories.downloads import SqlDownloadRepository
 from plex_manager.repositories.requests import SqlRequestRepository
@@ -5203,3 +5204,37 @@ async def test_a_commit_collision_releases_the_purge_claim(
 
     assert not purge_service.purge_in_progress(str(movie_file))
     assert movie_file.exists()  # nothing was deleted on the collision path
+
+
+async def test_report_issue_keeps_searching_when_partial_replacement_sources_are_unusable(
+    sessionmaker_: SessionMaker,
+    tmp_path: Path,
+) -> None:
+    class PartialProwlarr(FakeProwlarr):
+        async def search(self, request: IndexerSearchRequest) -> list[CandidateRelease]:
+            return IndexerSearchResults(await super().search(request), complete=False)
+
+    root = tmp_path / "movies"
+    root.mkdir()
+    movie_file = root / "Some Movie (2020).mkv"
+    movie_file.write_bytes(b"x" * 4096)
+    request_id = await _seed_available_movie(sessionmaker_, library_path=str(movie_file))
+    title = "Some.Movie.2020.1080p.WEB-DL.x264-BAD"
+    qbt = FakeQbittorrent(source_errors={f"http://idx.local/{title}"})
+    async with sessionmaker_() as session:
+        result = await correction_service.report_issue(
+            session,
+            qbt,
+            LocalFileSystem(library_roots=[str(root)]),
+            FakeLibrary(),
+            PartialProwlarr([candidate(title, magnet=False)]),
+            GuessitParser(),
+            default_profile(),
+            request_id=request_id,
+            reason="bad_quality",
+            season=None,
+            roots=LibraryRoots(movies=str(root)),
+        )
+        assert result.status == RequestStatus.searching
+        assert result.search_attempts == 0
+        assert result.next_search_at is None

@@ -56,6 +56,54 @@ def _scored(info_hash: str) -> ScoredRelease:
     )
 
 
+async def test_hashless_cross_indexer_grab_cannot_resurrect_a_blocklisted_torrent(
+    sessionmaker_: SessionMaker,
+) -> None:
+    async with sessionmaker_() as session:
+        request = MediaRequest(
+            tmdb_id=200,
+            media_type=MediaType.movie,
+            title="Some Movie",
+            status=RequestStatus.searching,
+        )
+        session.add(request)
+        await session.flush()
+        request_id = request.id
+        session.add_all(
+            [
+                Download(
+                    torrent_hash=_HASH, status="failed", media_request_id=request_id, tmdb_id=200
+                ),
+                Blocklist(
+                    torrent_hash=_HASH,
+                    source_title="Some.Movie.2020.1080p.WEB-DL.x264-GROUP",
+                    indexer="Original indexer",
+                    tmdb_id=200,
+                    media_type=MediaType.movie,
+                    reason="wrong_media",
+                ),
+            ]
+        )
+        await session.commit()
+    scored = _scored(_HASH)
+    scored = scored.model_copy(
+        update={
+            "candidate": scored.candidate.model_copy(
+                update={"info_hash": None, "indexer_name": "Other indexer"}
+            )
+        }
+    )
+    qbt = FakeQbittorrent()
+    async with sessionmaker_() as session:
+        with pytest.raises(Exception, match="blocklisted"):
+            await grab_service.grab(qbt, session, scored=scored, request_id=request_id, tmdb_id=200)
+    async with sessionmaker_() as session:
+        row = (
+            await session.execute(select(Download).where(Download.torrent_hash == _HASH))
+        ).scalar_one()
+        assert row.status == "failed"
+
+
 async def test_grab_reuses_terminal_row_and_reowns_to_current_request(
     sessionmaker_: SessionMaker,
 ) -> None:

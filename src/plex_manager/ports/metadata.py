@@ -64,6 +64,7 @@ class MovieMetadata(BaseModel):
     model_config = ConfigDict(frozen=True)
 
     tmdb_id: int
+    runtime_minutes: int | None = None
     imdb_id: str | None = None
     title: str
     year: int | None = None

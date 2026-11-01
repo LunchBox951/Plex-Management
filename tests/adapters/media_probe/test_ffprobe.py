@@ -78,6 +78,20 @@ def _stub_run(
     return calls
 
 
+@pytest.mark.parametrize(
+    "duration, expected", [("5163.456", 5163.456), ("N/A", None), ("nan", None), (0, None)]
+)
+def test_probe_reports_optional_runtime_without_rejecting_unknown_duration(
+    monkeypatch: pytest.MonkeyPatch,
+    duration: str | int,
+    expected: float | None,
+) -> None:
+    payload = _payload()
+    payload["format"] = {"format_name": "matroska,webm", "duration": duration}
+    _stub_run(monkeypatch, _completed(payload))
+    assert FfprobeMediaProbe().probe(Path("/downloads/movie.mkv")).duration_seconds == expected
+
+
 def test_probe_uses_bounded_no_shell_argv_and_compact_json(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

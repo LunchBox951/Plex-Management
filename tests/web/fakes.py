@@ -59,6 +59,7 @@ from plex_manager.web.deps import (
     get_qbittorrent,
     get_qbittorrent_optional,
     get_tmdb,
+    get_tmdb_optional,
 )
 
 __all__ = [
@@ -715,7 +716,9 @@ def override_adapters(
     variant) qBittorrent dependencies.
     """
     if tmdb is not None:
-        app.dependency_overrides[get_tmdb] = lambda: tmdb
+        app.dependency_overrides[get_tmdb_optional] = app.dependency_overrides[get_tmdb] = lambda: (
+            tmdb
+        )
     if prowlarr is not None:
         app.dependency_overrides[get_prowlarr] = lambda: prowlarr
     if qbt is not None:

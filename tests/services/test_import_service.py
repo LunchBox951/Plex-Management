@@ -35,6 +35,7 @@ from plex_manager.adapters.filesystem.local import LocalFileSystem, LocalFileSys
 from plex_manager.adapters.parser.guessit_adapter import GuessitParser
 from plex_manager.adapters.plex.library import PlexLibraryError
 from plex_manager.adapters.qbittorrent.adapter import QbittorrentError
+from plex_manager.adapters.tmdb import TmdbApiError, TmdbAuthError
 from plex_manager.db import Base, enable_sqlite_fk_enforcement
 from plex_manager.domain.quality import WEBDL1080P, QualitySource
 from plex_manager.domain.quality_profile import default_profile
@@ -63,6 +64,7 @@ from plex_manager.ports.media_probe import (
     MediaProbeResult,
     MediaProbeUnavailableError,
 )
+from plex_manager.ports.metadata import MovieMetadata
 from plex_manager.ports.repositories import DownloadRecord, DownloadScopeRecord
 from plex_manager.repositories import requests as requests_repo
 from plex_manager.repositories import season_requests as season_requests_repo
@@ -83,7 +85,7 @@ from plex_manager.services.import_service import (
     run_availability_cycle,
     run_import_cycle,
 )
-from tests.web.fakes import FakeLibrary, FakeMediaProbe, FakeQbittorrent, candidate
+from tests.web.fakes import FakeLibrary, FakeMediaProbe, FakeQbittorrent, FakeTmdb, candidate
 
 SessionMaker = async_sessionmaker[AsyncSession]
 
@@ -115,6 +117,178 @@ def _make_video(path: Path, size_bytes: int = 60 * 1024 * 1024) -> None:
     with path.open("wb") as handle:
         handle.seek(size_bytes - 1)
         handle.write(b"\0")
+
+
+async def test_runtime_conflict_is_retained_for_review_while_request_searches_again(
+    tmp_path: Path,
+    sessionmaker_: SessionMaker,
+) -> None:
+    class RuntimeProbe(FakeMediaProbe):
+        def probe(self, path: Path, *, timeout_seconds: float | None = None) -> MediaProbeResult:
+            return MediaProbeResult(
+                container="matroska", video_codec="h264", duration_seconds=5163.456
+            )
+
+    video = tmp_path / "downloads" / "The.Matrix.1999.1080p.WEB-DL.x264-GRP.mkv"
+    _make_video(video)
+    root = tmp_path / "library"
+    root.mkdir()
+    download_id, request_id = await _seed(
+        sessionmaker_, request_status=RequestStatus.downloading, download_status="import_pending"
+    )
+    qbt = _qbt(video)
+    async with sessionmaker_() as session:
+        record = await import_download(
+            download_id=download_id,
+            fs=LocalFileSystem(),
+            media_probe=RuntimeProbe(),
+            library=FakeLibrary(),
+            qbt=qbt,
+            parser=GuessitParser(),
+            profile=default_profile(),
+            session=session,
+            movies_root=str(root),
+            metadata=FakeTmdb(
+                movies={
+                    _TMDB_ID: MovieMetadata(
+                        tmdb_id=_TMDB_ID, title="The Matrix", year=1999, runtime_minutes=173
+                    )
+                }
+            ),
+        )
+    assert record is not None and record.status == "no_acceptable_release"
+    assert video.exists() and not any(root.iterdir())
+    assert qbt.removed == []
+    async with sessionmaker_() as session:
+        request = await session.get(MediaRequest, request_id)
+        assert request is not None and request.status == RequestStatus.searching
+        assert await SqlDownloadRepository(session).find_active_for_request(request_id) is None
+        queue = await SqlDownloadRepository(session).list_active_for_queue()
+        assert [item.id for item in queue] == [download_id]
+
+
+@pytest.mark.parametrize("has_replacement", [False, True])
+async def test_import_anyway_approves_only_the_runtime_hold_and_preserves_replacement_files(
+    tmp_path: Path,
+    sessionmaker_: SessionMaker,
+    has_replacement: bool,
+) -> None:
+    from plex_manager.services import import_review_service
+
+    class RuntimeProbe(FakeMediaProbe):
+        def probe(self, path: Path, *, timeout_seconds: float | None = None) -> MediaProbeResult:
+            return MediaProbeResult(
+                container="matroska", video_codec="h264", duration_seconds=5163.456
+            )
+
+    video = tmp_path / "downloads" / "The.Matrix.1999.1080p.WEB-DL.x264-GRP.mkv"
+    _make_video(video)
+    root = tmp_path / "library"
+    root.mkdir()
+    download_id, request_id = await _seed(
+        sessionmaker_, request_status=RequestStatus.downloading, download_status="import_pending"
+    )
+    metadata = FakeTmdb(
+        movies={
+            _TMDB_ID: MovieMetadata(
+                tmdb_id=_TMDB_ID, title="The Matrix", year=1999, runtime_minutes=173
+            )
+        }
+    )
+    qbt = _qbt(video)
+    async with sessionmaker_() as session:
+        await import_download(
+            download_id=download_id,
+            fs=LocalFileSystem(),
+            media_probe=RuntimeProbe(),
+            library=FakeLibrary(),
+            qbt=qbt,
+            parser=GuessitParser(),
+            profile=default_profile(),
+            session=session,
+            movies_root=str(root),
+            metadata=metadata,
+        )
+        if has_replacement:
+            session.add(
+                Download(
+                    torrent_hash="replacement",
+                    status="downloading",
+                    media_request_id=request_id,
+                    tmdb_id=_TMDB_ID,
+                )
+            )
+            await session.commit()
+        await import_review_service.approve_movie(session, qbt, download_id)
+        result = await import_download(
+            download_id=download_id,
+            fs=LocalFileSystem(),
+            media_probe=RuntimeProbe(),
+            library=FakeLibrary(),
+            qbt=qbt,
+            parser=GuessitParser(),
+            profile=default_profile(),
+            session=session,
+            movies_root=str(root),
+            metadata=metadata,
+        )
+        assert result is not None and result.status == "imported"
+        assert result.import_review_approved
+        assert (root / "The Matrix (1999)" / "The Matrix (1999).mkv").exists()
+        assert video.exists() and qbt.removed == []
+        assert (await session.execute(select(Blocklist))).scalars().all() == []
+        if has_replacement:
+            replacement = (
+                await session.execute(
+                    select(Download).where(Download.torrent_hash == "replacement")
+                )
+            ).scalar_one()
+            assert replacement.status == "failed"
+
+
+@pytest.mark.parametrize("cancelled", [False, True])
+async def test_import_anyway_keeps_review_and_replacement_active_when_stop_fails(
+    sessionmaker_: SessionMaker,
+    cancelled: bool,
+) -> None:
+    from plex_manager.services import import_review_service
+
+    class UnavailableClient(FakeQbittorrent):
+        async def pause(self, info_hash: str) -> None:
+            if cancelled:
+                raise asyncio.CancelledError("stop cancelled")
+            raise QbittorrentError("client unavailable")
+
+    async with sessionmaker_() as session:
+        request = MediaRequest(
+            tmdb_id=603,
+            media_type=MediaType.movie,
+            title="The Matrix",
+            status=RequestStatus.downloading,
+        )
+        session.add(request)
+        await session.flush()
+        held = Download(
+            torrent_hash="held",
+            media_request_id=request.id,
+            status="no_acceptable_release",
+            import_review_reason="runtime conflict",
+        )
+        replacement = Download(
+            torrent_hash="replacement", media_request_id=request.id, status="downloading"
+        )
+        session.add_all([held, replacement])
+        await session.commit()
+        expected_error = (
+            asyncio.CancelledError if cancelled else import_review_service.ImportReviewConflictError
+        )
+        with pytest.raises(expected_error, match="stop"):
+            await import_review_service.approve_movie(session, UnavailableClient(), held.id)
+        await session.refresh(held)
+        await session.refresh(replacement)
+        assert not held.import_review_approved
+        assert held.status == "no_acceptable_release"
+        assert replacement.status == "downloading"
 
 
 async def _seed(
@@ -6855,3 +7029,39 @@ async def test_import_scan_error_never_rejects_payload(
     assert not qbt.removed
     async with sessionmaker_() as session:
         assert not (await session.execute(select(Blocklist))).scalars().all()
+
+
+@pytest.mark.parametrize("metadata_error", [TmdbApiError, TmdbAuthError])
+async def test_unavailable_optional_runtime_metadata_does_not_block_valid_import(
+    tmp_path: Path,
+    sessionmaker_: SessionMaker,
+    metadata_error: type[RuntimeError],
+) -> None:
+    class UnavailableRuntime(FakeTmdb):
+        async def get_movie(self, tmdb_id: int) -> MovieMetadata | None:
+            raise metadata_error("runtime metadata unavailable")
+
+    video = tmp_path / "downloads" / "The.Matrix.1999.1080p.WEB-DL.x264-GRP.mkv"
+    _make_video(video)
+    root = tmp_path / "library"
+    root.mkdir()
+    download_id, _request_id = await _seed(
+        sessionmaker_,
+        request_status=RequestStatus.downloading,
+        download_status="import_pending",
+    )
+    async with sessionmaker_() as session:
+        result = await import_download(
+            download_id=download_id,
+            fs=LocalFileSystem(),
+            media_probe=FakeMediaProbe(),
+            library=FakeLibrary(),
+            qbt=_qbt(video),
+            parser=GuessitParser(),
+            profile=default_profile(),
+            session=session,
+            movies_root=str(root),
+            metadata=UnavailableRuntime(),
+        )
+    assert result is not None and result.status == "imported"
+    assert (root / "The Matrix (1999)" / "The Matrix (1999).mkv").exists()

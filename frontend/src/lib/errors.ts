@@ -30,6 +30,7 @@ const DETAIL_MESSAGES: Record<string, string> = {
   no_grab_source: 'The download client refused the grab.',
   already_downloading: 'That request already has an active download.',
   grab_hash_unresolved: 'The download client took the grab but returned no hash.',
+  release_blocklisted: 'That torrent was already rejected for this title. Choose another release.',
   download_not_found: 'That download no longer exists.',
   invalid_state_transition: 'That action is not allowed from the current state.',
   removal_in_progress:

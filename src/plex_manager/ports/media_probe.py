@@ -54,6 +54,7 @@ class MediaProbeResult(BaseModel):
 
     container: str
     video_codec: str
+    duration_seconds: float | None = None
 
 
 @runtime_checkable

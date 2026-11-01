@@ -1984,6 +1984,17 @@
             "title": "Id",
             "type": "integer"
           },
+          "import_review_reason": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Import Review Reason"
+          },
           "media_request_id": {
             "anyOf": [
               {
@@ -6531,6 +6542,16 @@
             "schema": {
               "title": "Download Id",
               "type": "integer"
+            }
+          },
+          {
+            "in": "query",
+            "name": "import_anyway",
+            "required": false,
+            "schema": {
+              "default": false,
+              "title": "Import Anyway",
+              "type": "boolean"
             }
           }
         ],

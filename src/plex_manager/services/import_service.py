@@ -46,12 +46,14 @@ from sqlalchemy.exc import IntegrityError
 
 from plex_manager.adapters.filesystem.local import LocalFileSystemError
 from plex_manager.adapters.plex.library import PlexAuthError, PlexLibraryError
+from plex_manager.adapters.tmdb import TmdbApiError, TmdbAuthError
 from plex_manager.domain.import_validation import (
     EpisodeImportResult,
     VideoFile,
     validate_import,
     validate_season_import,
 )
+from plex_manager.domain.media_identity import movie_runtime_conflict
 from plex_manager.domain.naming import (
     plex_movie_relative_path,
     plex_tv_episode_relative_path,
@@ -71,7 +73,11 @@ from plex_manager.models import (
     DownloadScope,
     RequestStatus,
 )
-from plex_manager.ports.media_probe import MediaProbeError, MediaProbeUnavailableError
+from plex_manager.ports.media_probe import (
+    MediaProbeError,
+    MediaProbeResult,
+    MediaProbeUnavailableError,
+)
 from plex_manager.repositories.blocklist import SqlBlocklistRepository
 from plex_manager.repositories.downloads import SqlDownloadRepository
 from plex_manager.repositories.requests import SqlRequestRepository
@@ -79,6 +85,7 @@ from plex_manager.repositories.season_episode_states import SqlSeasonEpisodeStat
 from plex_manager.repositories.season_requests import SqlSeasonRequestRepository
 from plex_manager.services import (
     blocklist_service,
+    import_review_service,
     path_visibility,
     purge_service,
     season_episode_service,
@@ -97,6 +104,7 @@ if TYPE_CHECKING:
     )
     from plex_manager.ports.library import LibraryPort
     from plex_manager.ports.media_probe import MediaProbePort
+    from plex_manager.ports.metadata import MetadataPort
     from plex_manager.ports.parser import ParserPort
     from plex_manager.ports.repositories import DownloadRecord, RequestRecord, SeasonRequestRecord
 
@@ -581,7 +589,7 @@ def _probe_before_deadline(
     deadline: float,
     started: threading.Event,
     cancelled: threading.Event,
-) -> None:
+) -> MediaProbeResult:
     """Run one synchronous probe using budget left after executor queueing."""
     started.set()
     if cancelled.is_set():
@@ -589,11 +597,11 @@ def _probe_before_deadline(
     remaining = deadline - time.monotonic()
     if remaining <= 0:
         raise TimeoutError
-    media_probe.probe(path, timeout_seconds=remaining)
+    return media_probe.probe(path, timeout_seconds=remaining)
 
 
 async def _stop_or_join_probe_task(
-    task: asyncio.Task[None],
+    task: asyncio.Task[MediaProbeResult],
     *,
     started: threading.Event,
     cancelled: threading.Event,
@@ -618,6 +626,7 @@ async def _inspect_sources(fs: FileSystemPort, content: str) -> list[tuple[str, 
 async def _verified_plex_video_sources(
     media_probe: MediaProbePort,
     sources: list[tuple[str, int, str]],
+    probe_results: dict[str, MediaProbeResult] | None = None,
 ) -> list[tuple[str, int, str]]:
     """Keep only real, suffix-consistent video candidates accepted by ffprobe.
 
@@ -677,7 +686,7 @@ async def _verified_plex_video_sources(
         )
         try:
             async with asyncio.timeout(remaining):
-                await asyncio.shield(probe_task)
+                probe_result = await asyncio.shield(probe_task)
         except TimeoutError:
             await _stop_or_join_probe_task(
                 probe_task,
@@ -705,6 +714,8 @@ async def _verified_plex_video_sources(
             rejected += 1
         else:
             accepted.append(source)
+            if probe_results is not None:
+                probe_results[source[0]] = probe_result
 
     if not_attempted:
         # The deadline truncated the batch before every candidate could be
@@ -1149,6 +1160,7 @@ async def import_download(
     parser: ParserPort,
     profile: QualityProfile,
     session: AsyncSession,
+    metadata: MetadataPort | None = None,
     movies_root: str | None = None,
     tv_root: str | None = None,
     anime_movie_root: str | None = None,
@@ -1186,6 +1198,7 @@ async def import_download(
             parser=parser,
             profile=profile,
             session=session,
+            metadata=metadata,
             movies_root=movies_root,
             tv_root=tv_root,
             anime_movie_root=anime_movie_root,
@@ -1203,6 +1216,7 @@ async def _import_download_locked(
     parser: ParserPort,
     profile: QualityProfile,
     session: AsyncSession,
+    metadata: MetadataPort | None = None,
     movies_root: str | None = None,
     tv_root: str | None = None,
     anime_movie_root: str | None = None,
@@ -1391,9 +1405,10 @@ async def _import_download_locked(
         )
         return await download_repo.get_by_hash(torrent_hash)
     content = visible_content
+    probe_results: dict[str, MediaProbeResult] = {}
     try:
         sources = await _inspect_sources(fs, content)
-        sources = await _verified_plex_video_sources(media_probe, sources)
+        sources = await _verified_plex_video_sources(media_probe, sources, probe_results)
     except _VideoVerificationUnavailableError as exc:
         if entered_importing:
             return await _refresh_resumed_import_after_probe_outage(
@@ -1478,6 +1493,24 @@ async def _import_download_locked(
         return await download_repo.get_by_hash(torrent_hash)
     abs_by_rel = {rel: abs_path for abs_path, _size, rel in sources}
     src = abs_by_rel[validation.video.relative_path]
+    if metadata is not None and not row.import_review_approved and not entered_importing:
+        try:
+            movie = await metadata.get_movie(request.tmdb_id)
+        except (TmdbApiError, TmdbAuthError) as exc:
+            _logger.warning(
+                "runtime identity metadata unavailable (%s); retaining normal import checks",
+                type(exc).__name__,
+                extra={"request_id": safe_int(request.id)},
+            )
+        else:
+            probe_result = probe_results.get(src)
+            reason = movie_runtime_conflict(
+                probe_result.duration_seconds if probe_result is not None else None,
+                movie.runtime_minutes if movie is not None else None,
+            )
+            if reason is not None:
+                await import_review_service.hold_movie(session, row, reason)
+                return await download_repo.get_by_hash(torrent_hash)
     ext = os.path.splitext(src)[1].lstrip(".")
     relative = plex_movie_relative_path(request.title, request.year, ext)
     dst = Path(effective_movies_root) / relative
@@ -2761,6 +2794,7 @@ async def run_import_cycle(
     parser: ParserPort,
     profile: QualityProfile,
     session: AsyncSession,
+    metadata: MetadataPort | None = None,
     movies_root: str | None = None,
     tv_root: str | None = None,
     anime_movie_root: str | None = None,
@@ -2805,6 +2839,7 @@ async def run_import_cycle(
                     parser=parser,
                     profile=profile,
                     session=session,
+                    metadata=metadata,
                     movies_root=movies_root,
                     tv_root=tv_root,
                     anime_movie_root=anime_movie_root,

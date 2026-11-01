@@ -1755,6 +1755,7 @@ class QueueItem(BaseModel):
     season: int | None = None
     episodes: list[int] | None = None
     failed_reason: str | None = None
+    import_review_reason: str | None = None
     # Human-legible identity (issue #134): all three degrade honestly to
     # ``None`` rather than swallowing a missing join/backfill -- an orphaned
     # download (its request deleted), a pre-migration row with no backfillable

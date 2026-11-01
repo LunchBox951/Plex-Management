@@ -216,7 +216,7 @@ async def run_preview(
         raise HTTPException(
             status_code=status.HTTP_422_UNPROCESSABLE_CONTENT, detail="movie_grab_rejects_season"
         )
-    return await decision_service.preview(
+    result = await decision_service.preview(
         prowlarr,
         parser,
         profile,
@@ -229,6 +229,9 @@ async def run_preview(
         episodes=episodes,
         multi_season_intent=multi_season_intent,
     )
+    if not result.accepted:
+        decision_service.require_complete_search(result)
+    return result
 
 
 @router.post("/search-preview", responses=_SEARCH_PREVIEW_RESPONSES)

@@ -162,8 +162,9 @@ export function Queue() {
   // "Retry import" button calls.
   async function runImport(item: QueueItem) {
     try {
-      await importDownload.mutateAsync(item.id)
-      toast({ title: 'Retrying import', intent: 'success' })
+      await importDownload.mutateAsync(item.status === 'no_acceptable_release' && item.import_review_reason
+        ? { downloadId: item.id, importAnyway: true } : item.id)
+      toast({ title: item.import_review_reason ? 'Import approved' : 'Retrying import', intent: 'success' })
     } catch (err) {
       toast({
         title: 'Import retry failed',
@@ -304,7 +305,8 @@ function QueueCard({
   onRetry: () => void
   onRelocate: () => void
 }) {
-  const presentation = downloadStatus(item.status)
+  const needsReview = item.status === 'no_acceptable_release' && Boolean(item.import_review_reason)
+  const presentation = needsReview ? { label: 'Needs review', intent: 'error' as const } : downloadStatus(item.status)
   const showTransferProgress = item.status === 'downloading'
   const canMarkFailed = isMarkFailableStatus(item.status)
   const progress = Math.min(1, Math.max(0, item.progress ?? 0))
@@ -397,6 +399,11 @@ function QueueCard({
           </div>
         ) : null}
 
+        {needsReview ? (
+          <p className="mt-2 text-[12.5px] leading-relaxed text-muted">
+            Importing anyway stops any replacement download and keeps its files.
+          </p>
+        ) : null}
         {item.failed_reason ? (
           <p className="mt-2 text-[12.5px] leading-relaxed text-error [overflow-wrap:anywhere]">
             {item.failed_reason}
@@ -416,14 +423,14 @@ function QueueCard({
             Relocate &amp; retry
           </Button>
         ) : null}
-        {item.status === 'import_blocked' ? (
+        {item.status === 'import_blocked' || needsReview ? (
           <Button
             size="sm"
             loading={importPending}
             disabled={importPending || disabled}
             onClick={onRetry}
           >
-            Retry import
+            {needsReview ? 'Import anyway' : 'Retry import'}
           </Button>
         ) : null}
         {canMarkFailed ? (
