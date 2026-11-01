@@ -22,6 +22,7 @@ from collections.abc import Mapping, Sequence
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Final
 
+from sqlalchemy import update
 from sqlalchemy.exc import IntegrityError
 
 from plex_manager.domain.payload_validation import (
@@ -32,6 +33,7 @@ from plex_manager.domain.reconciler import METADATA_STALL_WINDOW
 from plex_manager.domain.state_machine import TERMINAL_STATES, DownloadState
 from plex_manager.logsafe import safe_int, safe_text
 from plex_manager.models import (
+    Download,
     DownloadHistory,
     DownloadHistoryEvent,
     RequestStatus,
@@ -173,6 +175,13 @@ class NoGrabSourceError(Exception):
     def __init__(self, guid: str) -> None:
         self.guid = guid
         super().__init__(f"release {guid} has no magnet or download url")
+
+
+class ReleaseBlocklistedError(Exception):
+    """The resolved torrent is excluded for this request, regardless of indexer."""
+
+    def __init__(self) -> None:
+        super().__init__("release is blocklisted for this media")
 
 
 class AlreadyDownloadingError(Exception):
@@ -419,6 +428,15 @@ async def _reuse_terminal_row(
         if record is None:  # pragma: no cover - the row existed before the CAS
             raise LookupError(f"download for hash {torrent_hash} vanished mid-grab")
         return record, False
+    await session.execute(
+        update(Download)
+        .where(Download.id == download_id)
+        .values(
+            import_review_reason=None,
+            import_review_approved=False,
+            import_review_blocklist_id=None,
+        )
+    )
     record = await download_repo.get_by_hash(torrent_hash)
     if record is None:  # pragma: no cover - just updated this row
         raise LookupError(f"download for hash {torrent_hash} vanished mid-grab")
@@ -1249,6 +1267,15 @@ async def grab(
     # Pre-check on the candidate's own hash (when the indexer supplied one) so a
     # known duplicate never even hits the client.
     known_hash = candidate.info_hash.lower() if candidate.info_hash else None
+    if await SqlBlocklistRepository(session).is_blocklisted(
+        tmdb_id,
+        known_hash,
+        candidate.title,
+        candidate.indexer_name,
+        media_type=request_media_type,
+    ):
+        raise ReleaseBlocklistedError
+
     if known_hash is not None:
         pre = await download_repo.get_by_hash(known_hash)
         # #206 (pre-add): the indexer gave us the hash up front, so if it maps to a
@@ -1356,6 +1383,22 @@ async def grab(
         raise GrabError(candidate.title)
 
     existing = await download_repo.get_by_hash(torrent_hash)
+    if await SqlBlocklistRepository(session).is_blocklisted(
+        tmdb_id,
+        torrent_hash,
+        candidate.title,
+        candidate.indexer_name,
+        media_type=request_media_type,
+    ):
+        if existing is None:
+            await _remove_torrent_if_added(
+                qbt,
+                torrent_hash,
+                actually_added=actually_added,
+                request_id=request_id,
+                reason="rejecting a resolved blocklisted torrent",
+            )
+        raise ReleaseBlocklistedError
     tracked = existing is not None and existing.status not in _TERMINAL_STATUS_VALUES
     if existing is not None and tracked:
         if request_id is not None and existing.media_request_id != request_id:

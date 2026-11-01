@@ -1671,6 +1671,22 @@ async def test_import_endpoint_no_upfront_409_for_unset_root_nonexistent_downloa
     assert response.json()["detail"] == "download_not_found"
 
 
+async def test_import_anyway_is_restricted_to_a_pending_review(
+    app: FastAPI,
+    client: httpx.AsyncClient,
+    seed: SeedFn,
+    sessionmaker_: SessionMaker,
+) -> None:
+    await seed(initialized=True, app_api_key=_API_KEY)
+    override_adapters(app, qbt=FakeQbittorrent(), library=FakeLibrary())
+    download_id, _request_id = await _insert_movie_download(sessionmaker_)
+    response = await client.post(
+        f"/api/v1/queue/{download_id}/import?import_anyway=true", headers=_HEADERS
+    )
+    assert response.status_code == 409
+    assert "no longer awaiting review" in response.json()["detail"]
+
+
 async def _insert_movie_download(sm: SessionMaker) -> tuple[int, int]:
     """Insert a movie request + an ImportPending download; (download_id, request_id)."""
     async with sm() as session:

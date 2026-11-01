@@ -248,6 +248,7 @@ _UNRESOLVED_SCOPE_STATUSES: Final[frozenset[str]] = frozenset({"active", "import
 # (bounded) and only parks when the list/cap exhausts.
 _PER_RELEASE_GRAB_ERRORS: Final = (
     grab_service.NoGrabSourceError,
+    grab_service.ReleaseBlocklistedError,
     grab_service.TorrentAlreadyTrackedError,
     QbittorrentSourceError,
 )

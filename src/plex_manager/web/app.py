@@ -760,8 +760,13 @@ async def _reconcile_once_leased(app: FastAPI) -> None:
                     tv_root = await get_tv_root_optional(session)
                     anime_movie_root = await get_anime_movie_root_optional(session)
                     anime_tv_root = await get_anime_tv_root_optional(session)
+                    try:
+                        import_metadata = await resolve_tmdb(app.state, session, client)
+                    except ServiceNotConfiguredError:
+                        import_metadata = None
                     imported = await import_service.run_import_cycle(
                         fs=get_filesystem(),
+                        metadata=import_metadata,
                         media_probe=get_media_probe(),
                         library=library,
                         qbt=qbt,

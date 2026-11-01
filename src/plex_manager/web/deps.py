@@ -1420,6 +1420,17 @@ async def get_tmdb(
     return await resolve_tmdb(request.app.state, session, client)
 
 
+async def get_tmdb_optional(
+    request: Request,
+    session: Annotated[AsyncSession, Depends(get_session)],
+    client: Annotated[httpx.AsyncClient, Depends(get_http_client)],
+) -> MetadataPort | None:
+    try:
+        return await get_tmdb(request, session, client)
+    except ServiceNotConfiguredError:
+        return None
+
+
 @dataclass(frozen=True)
 class _CachedProwlarr:
     """One cached :class:`ProwlarrIndexer` plus the key (settings + the

@@ -340,6 +340,7 @@ class TmdbMetadata:
         external_ids = _as_mapping(detail.get("external_ids"))
         movie = MovieMetadata(
             tmdb_id=_get_int(detail, "id") or tmdb_id,
+            runtime_minutes=_get_int(detail, "runtime"),
             imdb_id=_get_str(detail, "imdb_id") or _get_str(external_ids, "imdb_id"),
             title=_get_str(detail, "title") or "",
             year=_year_from_date(detail, "release_date"),

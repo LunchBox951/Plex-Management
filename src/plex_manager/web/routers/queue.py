@@ -17,6 +17,7 @@ from plex_manager.ports.filesystem import FileSystemPort
 from plex_manager.ports.indexer import IndexerPort
 from plex_manager.ports.library import LibraryPort
 from plex_manager.ports.media_probe import MediaProbePort
+from plex_manager.ports.metadata import MetadataPort
 from plex_manager.ports.parser import ParserPort
 from plex_manager.ports.repositories import DownloadRecord, QueueRecord
 from plex_manager.repositories.downloads import SqlDownloadRepository
@@ -24,6 +25,7 @@ from plex_manager.repositories.season_requests import SqlSeasonRequestRepository
 from plex_manager.services import (
     correction_service,
     grab_service,
+    import_review_service,
     import_service,
     queue_service,
     request_service,
@@ -33,6 +35,7 @@ from plex_manager.services.grab_service import (
     AlreadyDownloadingError,
     GrabError,
     NoGrabSourceError,
+    ReleaseBlocklistedError,
     RequestNotActiveError,
     SeasonRequiredError,
     TorrentAlreadyTrackedError,
@@ -54,6 +57,7 @@ from plex_manager.web.deps import (
     get_qbittorrent_optional,
     get_quality_profile,
     get_session,
+    get_tmdb_optional,
     get_tv_root_optional,
     require_admin,
 )
@@ -141,6 +145,7 @@ def _to_item(record: DownloadRecord) -> QueueItem:
         season=record.season,
         episodes=record.episodes,
         failed_reason=record.failed_reason,
+        import_review_reason=record.import_review_reason,
         title=record.title if isinstance(record, QueueRecord) else None,
         poster_url=record.poster_url if isinstance(record, QueueRecord) else None,
         release_title=record.release_title,
@@ -381,6 +386,8 @@ async def grab_endpoint(
             scope_episodes_by_season=scope_episodes_by_season,
             save_path=downloads_host_root,
         )
+    except ReleaseBlocklistedError as exc:
+        raise HTTPException(status_code=409, detail="release_blocklisted") from exc
     except NoGrabSourceError as exc:
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="no_grab_source") from exc
     except SeasonRequiredError as exc:
@@ -448,6 +455,8 @@ async def import_endpoint(
     tv_root: Annotated[str | None, Depends(get_tv_root_optional)],
     anime_movie_root: Annotated[str | None, Depends(get_anime_movie_root_optional)],
     anime_tv_root: Annotated[str | None, Depends(get_anime_tv_root_optional)],
+    metadata: Annotated[MetadataPort | None, Depends(get_tmdb_optional)],
+    import_anyway: Annotated[bool, Query()] = False,
 ) -> QueueItem:
     """Operator retry: (re)run the import for a download (e.g. an ImportBlocked row).
 
@@ -459,6 +468,11 @@ async def import_endpoint(
     ONE root configured can still retry-import that type. The
     correction-without-a-terminal button for a blocked import.
     """
+    if import_anyway:
+        try:
+            await import_review_service.approve_movie(session, qbt, download_id)
+        except import_review_service.ImportReviewConflictError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
     record = await import_service.import_download(
         download_id=download_id,
         fs=fs,
@@ -468,6 +482,7 @@ async def import_endpoint(
         parser=parser,
         profile=profile,
         session=session,
+        metadata=metadata,
         movies_root=movies_root,
         tv_root=tv_root,
         anime_movie_root=anime_movie_root,

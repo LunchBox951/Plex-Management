@@ -97,6 +97,7 @@ from plex_manager.services.grab_service import (
     AlreadyDownloadingError,
     GrabError,
     NoGrabSourceError,
+    ReleaseBlocklistedError,
     RequestNotActiveError,
     SeasonRequiredError,
     TorrentAlreadyTrackedError,
@@ -826,7 +827,7 @@ async def _attempt_episode_fallback(
                     "attempts_total": len(fb_candidates),
                 },
             )
-        except (NoGrabSourceError, TorrentAlreadyTrackedError) as exc:
+        except (NoGrabSourceError, ReleaseBlocklistedError, TorrentAlreadyTrackedError) as exc:
             # Same fall-through posture as the Pass-1 loop's sibling handler.
             await session.rollback()
             _logger.warning(
@@ -1380,6 +1381,7 @@ async def run_grab_cycle(
                 )
             except (
                 NoGrabSourceError,
+                ReleaseBlocklistedError,
                 TorrentAlreadyTrackedError,
             ) as exc:
                 # A release WAS accepted but cannot be grabbed right now, and NOTHING

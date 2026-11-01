@@ -881,6 +881,9 @@ class Download(Base):
     completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     failed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     failed_reason: Mapped[str | None] = mapped_column(String)
+    import_review_reason: Mapped[str | None] = mapped_column(String)
+    import_review_approved: Mapped[bool] = mapped_column(default=False, server_default=sa.false())
+    import_review_blocklist_id: Mapped[int | None] = mapped_column()
     # Consecutive resumed-import probe-outage retries (issue #180): bumped by
     # ``import_service._refresh_resumed_import_after_probe_outage`` each cycle a
     # crash-resumed ``Importing`` row auto-retries after

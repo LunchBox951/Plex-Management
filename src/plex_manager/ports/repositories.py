@@ -159,6 +159,8 @@ class DownloadRecord(BaseModel):
     episodes: list[int] | None = None
     media_type: str | None = None
     failed_reason: str | None = None
+    import_review_reason: str | None = None
+    import_review_approved: bool = False
     payload_pending: bool = False
     payload_resume: bool = False
     payload_force_start: bool = False

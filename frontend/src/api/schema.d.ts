@@ -2760,6 +2760,8 @@ export interface components {
             failed_reason?: string | null;
             /** Id */
             id: number;
+            /** Import Review Reason */
+            import_review_reason?: string | null;
             /** Media Request Id */
             media_request_id?: number | null;
             /** Poster Url */
@@ -4748,7 +4750,9 @@ export interface operations {
     };
     import_endpoint_api_v1_queue__download_id__import_post: {
         parameters: {
-            query?: never;
+            query?: {
+                import_anyway?: boolean;
+            };
             header?: never;
             path: {
                 download_id: number;

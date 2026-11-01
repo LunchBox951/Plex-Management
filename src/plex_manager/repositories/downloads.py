@@ -119,6 +119,8 @@ def _to_record(row: Download, scopes: list[DownloadScopeRecord] | None = None) -
         episodes=row.episodes_json,
         media_type=row.media_type.value if row.media_type is not None else None,
         failed_reason=row.failed_reason,
+        import_review_reason=row.import_review_reason,
+        import_review_approved=row.import_review_approved,
         payload_pending=row.payload_pending,
         payload_resume=row.payload_resume,
         payload_force_start=row.payload_force_start,
@@ -602,6 +604,8 @@ class SqlDownloadRepository:
             .where(
                 or_(
                     Download.status.notin_(_TERMINAL_DOWNLOAD_STATUSES),
+                    (Download.status == "no_acceptable_release")
+                    & Download.import_review_reason.is_not(None),
                     (Download.status == "failed")
                     & Download.payload_rejection.is_not(None)
                     & (Download.failed_at >= datetime.now(UTC) - timedelta(days=1)),

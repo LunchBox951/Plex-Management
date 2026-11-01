@@ -1,7 +1,7 @@
 """ProwlarrIndexer — the live :class:`IndexerPort` implementation (Prowlarr v1).
 
-Searches the configured indexers through Prowlarr's aggregating ``/api/v1/search``
-endpoint and normalizes each ``ReleaseResource`` into the frozen domain
+Searches enabled torrent indexers independently through ``/api/v1/search`` and
+merges successful responses into the frozen domain
 :class:`~plex_manager.domain.release.CandidateRelease` DTO. Grabbing is a separate
 concern (the download client) and is deliberately not done here.
 
@@ -31,6 +31,7 @@ Behaviours carried over from the analysis extract:
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 from collections.abc import Mapping, Sequence
@@ -42,6 +43,7 @@ import httpx
 from plex_manager.adapters.service_url import InvalidServiceUrl, ServiceUrl
 from plex_manager.domain.release import CandidateRelease, IndexerSearchRequest
 from plex_manager.headersafe import header_value_error
+from plex_manager.logsafe import safe_int
 
 __all__ = ["IndexerError", "IndexerRateLimitError", "ProwlarrIndexer"]
 
@@ -54,13 +56,11 @@ _HTTP_MULTIPLE_CHOICES: Final = 300
 _HTTP_BAD_REQUEST: Final = 400
 _DEFAULT_INDEXER_PRIORITY: Final = 25
 _PRIORITY_TTL_SECONDS: Final = 300.0
-# Indexer searches fan out across every configured tracker, so a single search
-# routinely runs far longer than a normal HTTP call (a popular movie can return
-# hundreds of releases across a dozen indexers, ~60s+). The shared client's
-# default timeout (~30s) would abort real searches, so the search request gets a
-# generous, configurable override. The prototype used 300s; 120s is the default
-# here and is tunable per deployment.
+# Bound the whole search separately from each indexer so a slow source cannot
+# discard completed results or multiply the caller's deadline without limit.
 _DEFAULT_SEARCH_TIMEOUT: Final = 120.0
+_INDEXER_SEARCH_TIMEOUT: Final = 45.0
+_SEARCH_CONCURRENCY: Final = 4
 _EPOCH: Final = datetime(1970, 1, 1, tzinfo=UTC)
 
 # One query-param pair; the value union matches httpx's ``PrimitiveData`` so the
@@ -214,6 +214,7 @@ class ProwlarrIndexer:
         # indexerId -> priority, resolved from /api/v1/indexer and cached with a
         # short TTL so a reconciler loop does not re-fetch on every search.
         self._priority_cache: tuple[datetime, Mapping[int, int]] | None = None
+        self._enabled_indexer_ids: tuple[int, ...] | None = None
 
     def __repr__(self) -> str:  # pragma: no cover - trivial, redacts the key
         return f"ProwlarrIndexer(base_url={self._base_url!r}, api_key=<redacted>)"
@@ -267,8 +268,69 @@ class ProwlarrIndexer:
         return params
 
     async def search(self, request: IndexerSearchRequest) -> list[CandidateRelease]:
-        """Run ``request`` and return de-duplicated candidate releases."""
+        """Merge independently bounded searches, retaining healthy indexer results."""
         priorities = await self._indexer_priorities()
+        indexer_ids = request.indexer_ids or self._enabled_indexer_ids
+        if indexer_ids is None:
+            # Discovery failed: preserve the existing aggregate fallback rather
+            # than inventing an empty result or guessing which indexers exist.
+            return await self._search_one(request, priorities)
+        if not indexer_ids:
+            return []
+        semaphore = asyncio.Semaphore(_SEARCH_CONCURRENCY)
+
+        async def search_indexer(indexer_id: int) -> list[CandidateRelease]:
+            async with semaphore:
+                try:
+                    return await asyncio.wait_for(
+                        self._search_one(
+                            request.model_copy(update={"indexer_ids": (indexer_id,)}),
+                            priorities,
+                        ),
+                        timeout=min(_INDEXER_SEARCH_TIMEOUT, self._search_timeout),
+                    )
+                except TimeoutError as exc:
+                    raise IndexerError("Prowlarr indexer search timed out") from exc
+
+        tasks = [asyncio.create_task(search_indexer(indexer_id)) for indexer_id in indexer_ids]
+        try:
+            done, pending = await asyncio.wait(tasks, timeout=self._search_timeout)
+            for task in pending:
+                task.cancel()
+            await asyncio.gather(*pending, return_exceptions=True)
+            candidates: list[CandidateRelease] = []
+            failures: list[IndexerError] = []
+            for indexer_id, task in zip(indexer_ids, tasks, strict=True):
+                if task not in done:
+                    error = IndexerError("Prowlarr search deadline exceeded")
+                else:
+                    exception = task.exception()
+                    if exception is None:
+                        candidates.extend(task.result())
+                        continue
+                    if not isinstance(exception, IndexerError):
+                        raise exception
+                    error = exception
+                failures.append(error)
+                _logger.warning(
+                    "Prowlarr indexer %s search failed (%s); retaining other indexer results",
+                    safe_int(indexer_id),
+                    type(error).__name__,
+                )
+            if failures and not candidates:
+                # Partial failure cannot establish that no release exists. Keep
+                # the request retryable instead of applying a negative backoff.
+                raise failures[0]
+            return _dedupe_by_guid(candidates)
+        finally:
+            for task in tasks:
+                if not task.done():
+                    task.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
+
+    async def _search_one(
+        self, request: IndexerSearchRequest, priorities: Mapping[int, int]
+    ) -> list[CandidateRelease]:
         # Guard THIS request's key too: a cached-priority hit skips
         # _indexer_priorities' own guard, so the search path must not assume it ran.
         headers = self._auth_headers()
@@ -383,12 +445,21 @@ class ProwlarrIndexer:
             )
             return {}
         mapping: dict[int, int] = {}
+        enabled: list[int] = []
         for raw in _as_sequence(payload):
             row = _as_mapping(raw)
             indexer_id = _get_opt_int(row, "id")
             priority = _get_opt_int(row, "priority")
             if indexer_id is not None and priority is not None:
                 mapping[indexer_id] = priority
+            if (
+                indexer_id is not None
+                and row.get("enable", True) is True
+                and row.get("protocol", "torrent") == "torrent"
+                and row.get("supportsSearch", True) is True
+            ):
+                enabled.append(indexer_id)
+        self._enabled_indexer_ids = tuple(enabled)
         self._priority_cache = (now, mapping)
         return mapping
 

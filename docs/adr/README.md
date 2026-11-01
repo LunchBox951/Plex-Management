@@ -38,6 +38,7 @@ once accepted — to change a decision, add a new ADR that supersedes the old on
 | [0030](0030-pre-add-intent-review-and-rollout.md) | Pre-add intent review constraints and compatible rollout (proposes to supersede parts of ADR-0029) | Proposed |
 | [0031](0031-pre-download-payload-validation.md) | Validate torrent filenames and select videos before payload download | Accepted (superseded in part by 0032) |
 | [0032](0032-held-orphan-ownership-at-grab.md) | Take ownership of a held orphan when a grab reuses it (supersedes one sentence of ADR-0031) | Accepted |
+| [0033](0033-retain-suspect-movie-imports-for-review.md) | Retain suspect movie imports for review while replacement search continues | Accepted |
 
 ADRs 0001–0007 were accepted on **2026-06-29** during the v2 brainstorming
 session; 0008 during the first backend-alpha session; 0009 during the
